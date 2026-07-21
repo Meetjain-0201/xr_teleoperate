@@ -165,17 +165,19 @@ class Inspire_Controller_DFX_ctrl:
     inspire_modbus_dds_bridge.py needs no changes), but takes each Quest controller's
     analog trigger value as input instead of hand-tracking retargeting.
 
-    First-version safety defaults (per user request 2026-07-21): grip closure is
-    clamped to a conservative max, and target changes are rate-limited per control
-    cycle to avoid abrupt snaps. Both are configurable via env vars so they can be
-    loosened once trusted:
-      G1_INSPIRE_CTRL_MAX_CLOSURE (default 0.5): 0.0 = never closes at all,
-        1.0 = fully closes. Applies to the four gripping fingers only.
+    Grip closure and rate are configurable via env vars:
+      G1_INSPIRE_CTRL_MAX_CLOSURE (default 1.0, loosened from an initial 0.5 first-
+        version default per live testing 2026-07-21): 0.0 = never closes at all,
+        1.0 = fully closes. Applies to all six DOF, including thumb (see below).
       G1_INSPIRE_CTRL_RATE_LIMIT (default 0.05): max change in target q per control
-        cycle (cycle length is 1/fps).
-    Thumb bend/rotation are deliberately left at the fully-open rest value in this
-    first version — trigger drives grip (pinky/ring/middle/index) only, thumb motion
-    is out of scope until this is trusted and loosened.
+        cycle (cycle length is 1/fps) -- this is a smoothing limit, not a range
+        limit, and is unrelated to max_closure.
+    All six DOF (pinky/ring/middle/index/thumb-bend/thumb-rotation) move
+    proportionally with trigger depth -- this was originally thumb-excluded in the
+    first version, but live testing showed that felt like "not gripping properly"
+    without the thumb participating, so all six now follow the trigger together.
+    Trigger behaves as a continuous analog control (not a toggle) throughout --
+    confirmed via live testing that partial presses produce partial closure.
     """
     def __init__(self, left_gripper_trigger_in, right_gripper_trigger_in,
                        dual_hand_data_lock = None, dual_hand_state_array = None, dual_hand_action_array = None,
@@ -183,7 +185,7 @@ class Inspire_Controller_DFX_ctrl:
         logger_mp.info("Initialize Inspire_Controller_DFX_ctrl...")
         self.fps = fps
         self.simulation_mode = simulation_mode
-        self.max_closure = float(os.getenv("G1_INSPIRE_CTRL_MAX_CLOSURE", "0.5"))
+        self.max_closure = float(os.getenv("G1_INSPIRE_CTRL_MAX_CLOSURE", "1.0"))
         self.rate_limit = float(os.getenv("G1_INSPIRE_CTRL_RATE_LIMIT", "0.05"))
         logger_mp.info(f"[Inspire_Controller_DFX_ctrl] max_closure={self.max_closure}, rate_limit={self.rate_limit}")
 
@@ -250,9 +252,10 @@ class Inspire_Controller_DFX_ctrl:
         for idx, id in enumerate(Inspire_Right_Hand_JointIndex):
             self.hand_msg.cmds[id].q = 1.0
 
-        # gripping fingers are pinky/ring/middle/index (indices 0-3); thumb bend/rotation
-        # (indices 4-5) stay at rest for this first version
-        grip_indices = [0, 1, 2, 3]
+        # all six DOF (pinky/ring/middle/index/thumb-bend/thumb-rotation) follow
+        # trigger depth together -- thumb was excluded in the first version, but
+        # that made grip feel incomplete, so it's included now
+        grip_indices = [0, 1, 2, 3, 4, 5]
         min_q = 1.0 - self.max_closure
 
         try:
