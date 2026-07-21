@@ -290,6 +290,13 @@ if __name__ == '__main__':
         left_wrist_img = None
         right_wrist_img = None
 
+        # Loop-rate diagnostic (2026-07-21, investigating reported walking
+        # latency/"just moves forward" symptom) -- logs once/sec whether the
+        # control loop is keeping up with --frequency. Doesn't change behavior,
+        # only visibility.
+        _loop_diag_window_elapsed = []
+        _loop_diag_last_log = time.time()
+
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
@@ -337,10 +344,14 @@ if __name__ == '__main__':
                 with right_gripper_squeeze_in.get_lock():
                     right_gripper_squeeze_in.value = tele_data.right_ctrl_squeezeValue
             elif args.ee == "inspire_dfx" and args.input_mode == "controller":
+                # Confirmed swapped on this robot (2026-07-21 live test) -- right
+                # controller's trigger drives the left hand and vice versa. Matches
+                # PC2's own custom stack, which has a G1_TELEOP_SWAP_HANDS env var for
+                # apparently the same characteristic on this setup.
                 with left_gripper_trigger_in.get_lock():
-                    left_gripper_trigger_in.value = tele_data.left_ctrl_triggerValue
+                    left_gripper_trigger_in.value = tele_data.right_ctrl_triggerValue
                 with right_gripper_trigger_in.get_lock():
-                    right_gripper_trigger_in.value = tele_data.right_ctrl_triggerValue
+                    right_gripper_trigger_in.value = tele_data.left_ctrl_triggerValue
             elif args.ee == "dex1" and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
@@ -547,6 +558,20 @@ if __name__ == '__main__':
             sleep_time = max(0, (1 / args.frequency) - time_elapsed)
             time.sleep(sleep_time)
             logger_mp.debug(f"main process sleep: {sleep_time}")
+
+            _loop_diag_window_elapsed.append(time_elapsed)
+            if current_time - _loop_diag_last_log >= 1.0:
+                target = 1.0 / args.frequency
+                overruns = sum(1 for e in _loop_diag_window_elapsed if e > target)
+                avg_ms = (sum(_loop_diag_window_elapsed) / len(_loop_diag_window_elapsed)) * 1000
+                max_ms = max(_loop_diag_window_elapsed) * 1000
+                actual_hz = len(_loop_diag_window_elapsed) / (current_time - _loop_diag_last_log)
+                logger_mp.info(
+                    f"[loop-diag] target={args.frequency:.1f}Hz actual={actual_hz:.1f}Hz "
+                    f"avg_iter={avg_ms:.1f}ms max_iter={max_ms:.1f}ms overruns={overruns}/{len(_loop_diag_window_elapsed)}"
+                )
+                _loop_diag_window_elapsed = []
+                _loop_diag_last_log = current_time
 
     except KeyboardInterrupt:
         logger_mp.info("⛔ KeyboardInterrupt, exiting program...")
