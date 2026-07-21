@@ -6,6 +6,7 @@ import numpy as np
 from enum import IntEnum
 import threading
 import time
+import os
 from multiprocessing import Process, Array
 
 import logging_mp
@@ -156,6 +157,152 @@ class Inspire_Controller_DFX:
         finally:
             logger_mp.info("Inspire_Controller_DFX has been closed.")
 
+
+class Inspire_Controller_DFX_ctrl:
+    """
+    Controller-tracking-mode counterpart to Inspire_Controller_DFX: drives the same
+    rt/inspire/cmd / rt/inspire/state DDS topics (same wire contract, PC2's
+    inspire_modbus_dds_bridge.py needs no changes), but takes each Quest controller's
+    analog trigger value as input instead of hand-tracking retargeting.
+
+    First-version safety defaults (per user request 2026-07-21): grip closure is
+    clamped to a conservative max, and target changes are rate-limited per control
+    cycle to avoid abrupt snaps. Both are configurable via env vars so they can be
+    loosened once trusted:
+      G1_INSPIRE_CTRL_MAX_CLOSURE (default 0.5): 0.0 = never closes at all,
+        1.0 = fully closes. Applies to the four gripping fingers only.
+      G1_INSPIRE_CTRL_RATE_LIMIT (default 0.05): max change in target q per control
+        cycle (cycle length is 1/fps).
+    Thumb bend/rotation are deliberately left at the fully-open rest value in this
+    first version — trigger drives grip (pinky/ring/middle/index) only, thumb motion
+    is out of scope until this is trusted and loosened.
+    """
+    def __init__(self, left_gripper_trigger_in, right_gripper_trigger_in,
+                       dual_hand_data_lock = None, dual_hand_state_array = None, dual_hand_action_array = None,
+                       fps = 100.0, simulation_mode = False, xr_motion_data_ready_in = None):
+        logger_mp.info("Initialize Inspire_Controller_DFX_ctrl...")
+        self.fps = fps
+        self.simulation_mode = simulation_mode
+        self.max_closure = float(os.getenv("G1_INSPIRE_CTRL_MAX_CLOSURE", "0.5"))
+        self.rate_limit = float(os.getenv("G1_INSPIRE_CTRL_RATE_LIMIT", "0.05"))
+        logger_mp.info(f"[Inspire_Controller_DFX_ctrl] max_closure={self.max_closure}, rate_limit={self.rate_limit}")
+
+        # initialize handcmd publisher and handstate subscriber (same topics as Inspire_Controller_DFX)
+        self.HandCmb_publisher = ChannelPublisher(kTopicInspireDFXCommand, MotorCmds_)
+        self.HandCmb_publisher.Init()
+
+        self.HandState_subscriber = ChannelSubscriber(kTopicInspireDFXState, MotorStates_)
+        self.HandState_subscriber.Init()
+
+        self.left_hand_state_array  = Array('d', Inspire_Num_Motors, lock=True)
+        self.right_hand_state_array = Array('d', Inspire_Num_Motors, lock=True)
+
+        self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
+        self.subscribe_state_thread.daemon = True
+        self.subscribe_state_thread.start()
+
+        while True:
+            if any(self.right_hand_state_array):
+                break
+            time.sleep(0.01)
+            logger_mp.warning("[Inspire_Controller_DFX_ctrl] Waiting to subscribe dds...")
+        logger_mp.info("[Inspire_Controller_DFX_ctrl] Subscribe dds ok.")
+
+        hand_control_process = Process(target=self.control_process, args=(left_gripper_trigger_in, right_gripper_trigger_in,
+                                                                          self.left_hand_state_array, self.right_hand_state_array,
+                                                                          dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, xr_motion_data_ready_in))
+        hand_control_process.daemon = True
+        hand_control_process.start()
+
+        logger_mp.info("Initialize Inspire_Controller_DFX_ctrl OK!")
+
+    def _subscribe_hand_state(self):
+        while True:
+            hand_msg = self.HandState_subscriber.Read()
+            if hand_msg is not None:
+                for idx, id in enumerate(Inspire_Left_Hand_JointIndex):
+                    self.left_hand_state_array[idx] = hand_msg.states[id].q
+                for idx, id in enumerate(Inspire_Right_Hand_JointIndex):
+                    self.right_hand_state_array[idx] = hand_msg.states[id].q
+            time.sleep(0.002)
+
+    def ctrl_dual_hand(self, left_q_target, right_q_target):
+        for idx, id in enumerate(Inspire_Left_Hand_JointIndex):
+            self.hand_msg.cmds[id].q = left_q_target[idx]
+        for idx, id in enumerate(Inspire_Right_Hand_JointIndex):
+            self.hand_msg.cmds[id].q = right_q_target[idx]
+        self.HandCmb_publisher.Write(self.hand_msg)
+
+    def control_process(self, left_gripper_trigger_in, right_gripper_trigger_in,
+                              left_hand_state_array, right_hand_state_array,
+                              dual_hand_data_lock = None, dual_hand_state_array = None, dual_hand_action_array = None,
+                              xr_motion_data_ready_in = None):
+        self.running = True
+
+        # start fully open (1.0), same rest convention as Inspire_Controller_DFX
+        left_q_target  = np.full(Inspire_Num_Motors, 1.0)
+        right_q_target = np.full(Inspire_Num_Motors, 1.0)
+
+        self.hand_msg = MotorCmds_()
+        self.hand_msg.cmds = [unitree_go_msg_dds__MotorCmd_() for _ in range(len(Inspire_Right_Hand_JointIndex) + len(Inspire_Left_Hand_JointIndex))]
+        for idx, id in enumerate(Inspire_Left_Hand_JointIndex):
+            self.hand_msg.cmds[id].q = 1.0
+        for idx, id in enumerate(Inspire_Right_Hand_JointIndex):
+            self.hand_msg.cmds[id].q = 1.0
+
+        # gripping fingers are pinky/ring/middle/index (indices 0-3); thumb bend/rotation
+        # (indices 4-5) stay at rest for this first version
+        grip_indices = [0, 1, 2, 3]
+        min_q = 1.0 - self.max_closure
+
+        try:
+            while self.running:
+                start_time = time.time()
+
+                with left_gripper_trigger_in.get_lock():
+                    left_trigger_raw = left_gripper_trigger_in.value
+                with right_gripper_trigger_in.get_lock():
+                    right_trigger_raw = right_gripper_trigger_in.value
+                if xr_motion_data_ready_in is not None:
+                    with xr_motion_data_ready_in.get_lock():
+                        xr_motion_data_ready = xr_motion_data_ready_in.value
+                else:
+                    xr_motion_data_ready = True
+
+                state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
+
+                if xr_motion_data_ready:
+                    # tele_data.*_ctrl_triggerValue convention: 10.0 = released, 0.0 = fully
+                    # pressed (see televuer's tv_wrapper.py) -> dividing by 10 already lands
+                    # on Inspire's own 1.0=open/0.0=closed convention, no inversion needed.
+                    left_grip  = np.clip(left_trigger_raw / 10.0, min_q, 1.0)
+                    right_grip = np.clip(right_trigger_raw / 10.0, min_q, 1.0)
+
+                    desired_left  = left_q_target.copy()
+                    desired_right = right_q_target.copy()
+                    for idx in grip_indices:
+                        desired_left[idx] = left_grip
+                        desired_right[idx] = right_grip
+
+                    # rate limit: cap how much the target can move per control cycle
+                    delta_left  = np.clip(desired_left - left_q_target, -self.rate_limit, self.rate_limit)
+                    delta_right = np.clip(desired_right - right_q_target, -self.rate_limit, self.rate_limit)
+                    left_q_target  = left_q_target + delta_left
+                    right_q_target = right_q_target + delta_right
+
+                action_data = np.concatenate((left_q_target, right_q_target))
+                if dual_hand_state_array and dual_hand_action_array:
+                    with dual_hand_data_lock:
+                        dual_hand_state_array[:] = state_data
+                        dual_hand_action_array[:] = action_data
+
+                self.ctrl_dual_hand(left_q_target, right_q_target)
+                current_time = time.time()
+                time_elapsed = current_time - start_time
+                sleep_time = max(0, (1 / self.fps) - time_elapsed)
+                time.sleep(sleep_time)
+        finally:
+            logger_mp.info("Inspire_Controller_DFX_ctrl has been closed.")
 
 
 kTopicInspireFTPLeftCommand   = "rt/inspire_hand/ctrl/l"

@@ -38,7 +38,15 @@ class LocoClientWrapper:
 
     def Enter_Damp_Mode(self):
         self.client.Damp()
-    
+
+    def Damp(self):
+        # Alias for Enter_Damp_Mode: teleop_hand_and_arm.py's double-thumbstick
+        # soft-e-stop path calls loco_wrapper.Damp() directly, which this class
+        # never defined (only Enter_Damp_Mode existed) -- that call would raise
+        # AttributeError instead of actually damping the robot. Local patch,
+        # 2026-07-21, ahead of first walking-mode use.
+        self.client.Damp()
+
     def Move(self, vx, vy, vyaw):
         self.client.Move(vx, vy, vyaw, continous_move=False)
 
