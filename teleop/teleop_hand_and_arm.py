@@ -70,6 +70,11 @@ def get_state() -> dict:
         "RECORD_RUNNING": RECORD_RUNNING,
     }
 
+# DIMENSO ADDITION: shared between the rt/reset_pose/cmd callback thread and the
+# main loop. Module level because the loop is module-level code, so a closure
+# cell would not be writable from the callback.
+_DIMENSO_RESET_FLAG = 0.0
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -275,9 +280,128 @@ if __name__ == '__main__':
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+        # ---------------- DIMENSO ADDITION: sim locomotion publisher ----------------
+        # rt/run_command/cmd is what unitree_sim_isaaclab's wholebody action provider
+        # reads as [vx, vy, yaw, height] (action_provider_wh_dds.py:313-326, default
+        # [0,0,0,0.8]). Nothing in this client published it, so the thumbsticks did
+        # nothing in sim. Published from HERE, not the backend, because this process
+        # already owns a CycloneDDS 0.10.2 participant on domain 1 -- an 11.x
+        # participant on the same domain segfaults this client during XTypes
+        # discovery. See robotics-api docker/isaac-sim-teleop/client-overrides/.
+        _dimenso_body_pub = None
+        if args.sim:
+            try:
+                from unitree_sdk2py.core.channel import ChannelPublisher as _DimensoPub
+                from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_ as _DimensoStr
+                _dimenso_body_pub = _DimensoPub("rt/run_command/cmd", _DimensoStr)
+                _dimenso_body_pub.Init()
+                logger_mp.info("[dimenso] locomotion publisher up on rt/run_command/cmd")
+            except Exception as _e:
+                logger_mp.error(f"[dimenso] could not create locomotion publisher: {_e}")
+
+        _DIMENSO_STAND_HEIGHT = 0.8
+        # Full-stick command, scaled to what THIS policy was trained to track.
+        #
+        # Upstream's sign convention is kept verbatim, but not its 0.3 cap. That cap comes
+        # from xr_teleoperate issue #135 and applies to the REAL robot driven by Unitree's
+        # own locomotion controller (`loco_wrapper.Move`, further down this file). The sim
+        # path publishes to AGILE's Velocity-G1-History-v0, whose CommandsCfg trained on:
+        #
+        #     lin_vel_x  (-0.5, 0.5)    lin_vel_y  (-0.5, 0.5)    ang_vel_z  (-1.0, 1.0)
+        #
+        # So 0.3 left 40% of the linear range and 70% of the YAW range unreachable, which
+        # is why turning felt disproportionately slower than walking. These are the trained
+        # ceilings: going past them does not go faster, it goes out of distribution, and a
+        # policy given a command it never saw tracks it worse rather than better.
+        #
+        # The real-robot path below still uses 0.3, deliberately. Do not unify them.
+        _DIMENSO_VX_MAX  = 0.5
+        _DIMENSO_VY_MAX  = 0.5
+        _DIMENSO_YAW_MAX = 1.0
+
+        def _dimenso_body_from_sticks(d):
+            return (-d.left_ctrl_thumbstickValue[1]  * _DIMENSO_VX_MAX,
+                    -d.left_ctrl_thumbstickValue[0]  * _DIMENSO_VY_MAX,
+                    -d.right_ctrl_thumbstickValue[0] * _DIMENSO_YAW_MAX)
+
+        def _dimenso_publish_body(vx, vy, yaw):
+            if _dimenso_body_pub is None:
+                return
+            try:
+                _dimenso_body_pub.Write(_DimensoStr(
+                    data=str([float(vx), float(vy), float(yaw), _DIMENSO_STAND_HEIGHT])))
+            except Exception:
+                pass  # a publish failure must never take the control loop down
+
+        # Both A buttons (left X + right A) held for ~0.4s engages. NOT the triggers
+        # -- those already drive the Inspire hands, so a trigger gesture would clench
+        # them at the instant of engage. NOT the thumbstick clicks -- upstream uses
+        # both of those for Damp(). The hold requirement is so a brushed button
+        # cannot engage a robot.
+        _DIMENSO_ENGAGE_TICKS = 12          # x 0.033s ~= 0.4s
+        _dimenso_engage_held = 0
+
+        # ---- DIMENSO ADDITION: arms home on scene reset ----
+        # A whole-scene reset restores the robot and the objects, but the ARMS are
+        # commanded by this client at ~30Hz from the operator's wrist pose, so the sim
+        # resets them and the very next tick drags them straight back. The reset has to
+        # be honoured HERE, in the loop that owns the arm command.
+        #
+        # Done as a WINDOW the main loop reads, not by calling
+        # arm_ctrl.ctrl_dual_arm_go_home() from the subscriber callback: that method
+        # blocks for up to 100 attempts, and the main loop would overwrite q_target with
+        # the IK solution on its next tick anyway. A flag has no contention.
+        #
+        # Deliberately does NOT disengage: after the window the arms follow the
+        # operator's hands again, so a reset never silently drops them out of teleop.
+        _DIMENSO_HOME_SECONDS = 1.5   # measured peak ~3.5 rad/s, so this reaches zero
+        # numpy is NOT imported by this file, and `np.zeros(14)` would have raised
+        # NameError inside the control loop -- a runtime-only failure py_compile cannot
+        # see. An ndarray is genuinely required: clip_arm_q_target() does
+        # `current_q + delta`, and upstream's own ctrl_dual_arm_go_home() passes
+        # np.zeros(14).
+        import numpy as _dimenso_np
+
+        if args.sim:
+            try:
+                from unitree_sdk2py.core.channel import ChannelSubscriber as _DimensoSub
+
+                def _dimenso_on_reset(msg):
+                    global _DIMENSO_RESET_FLAG
+                    try:
+                        if str(msg.data).strip() == "2":     # whole scene only
+                            _DIMENSO_RESET_FLAG = time.time() + _DIMENSO_HOME_SECONDS
+                            logger_mp.info("[dimenso] whole-scene reset seen -- sending arms home")
+                    except Exception:
+                        pass
+
+                _dimenso_reset_sub = _DimensoSub("rt/reset_pose/cmd", _DimensoStr)
+                _dimenso_reset_sub.Init(_dimenso_on_reset, 10)
+                logger_mp.info("[dimenso] watching rt/reset_pose/cmd for arms-home")
+            except Exception as _e:
+                logger_mp.error(f"[dimenso] could not subscribe to rt/reset_pose/cmd: {_e}")
+        # ------------------------- END DIMENSO ADDITION -----------------------------
+
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
+            # -------- DIMENSO ADDITION: engage from inside the headset --------
+            # This loop previously read NO controller state, so the only way to
+            # engage was a laptop keypress/IPC command -- impossible while holding
+            # both controllers in the pose the robot is about to snap to.
+            if args.input_mode == "controller":
+                try:
+                    _d = tv_wrapper.get_tele_data()
+                    if _d.left_ctrl_aButton and _d.right_ctrl_aButton:
+                        _dimenso_engage_held += 1
+                        if _dimenso_engage_held >= _DIMENSO_ENGAGE_TICKS:
+                            logger_mp.info("[dimenso] both A buttons held -- engaging")
+                            START = True
+                    else:
+                        _dimenso_engage_held = 0
+                except Exception:
+                    pass
+            # ---------------------- END DIMENSO ADDITION ----------------------
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
@@ -344,14 +468,32 @@ if __name__ == '__main__':
                 with right_gripper_squeeze_in.get_lock():
                     right_gripper_squeeze_in.value = tele_data.right_ctrl_squeezeValue
             elif args.ee == "inspire_dfx" and args.input_mode == "controller":
-                # Confirmed swapped on this robot (2026-07-21 live test) -- right
-                # controller's trigger drives the left hand and vice versa. Matches
-                # PC2's own custom stack, which has a G1_TELEOP_SWAP_HANDS env var for
-                # apparently the same characteristic on this setup.
-                with left_gripper_trigger_in.get_lock():
-                    left_gripper_trigger_in.value = tele_data.right_ctrl_triggerValue
-                with right_gripper_trigger_in.get_lock():
-                    right_gripper_trigger_in.value = tele_data.left_ctrl_triggerValue
+                # ---- DIMENSO ADDITION: the hand swap is PHYSICAL-ROBOT ONLY ----
+                # The cross below was confirmed on the real robot (2026-07-21 live
+                # test): right controller's trigger drives the left hand and vice
+                # versa, matching PC2's own stack, which carries a
+                # G1_TELEOP_SWAP_HANDS env var for apparently the same
+                # characteristic of that setup.
+                #
+                # It is WRONG IN SIM. unitree_sim_isaaclab wires rt/inspire/cmd
+                # straight through, so applying the hardware workaround here
+                # produced exactly the symptom it exists to fix -- reported live
+                # (2026-07-28): "the right one closes left palm and vice versa".
+                #
+                # Kept for the physical robot rather than deleted, because that
+                # observation was made on hardware and this session has no way to
+                # re-test it. --sim is the discriminator.
+                if args.sim:
+                    with left_gripper_trigger_in.get_lock():
+                        left_gripper_trigger_in.value = tele_data.left_ctrl_triggerValue
+                    with right_gripper_trigger_in.get_lock():
+                        right_gripper_trigger_in.value = tele_data.right_ctrl_triggerValue
+                else:
+                    with left_gripper_trigger_in.get_lock():
+                        left_gripper_trigger_in.value = tele_data.right_ctrl_triggerValue
+                    with right_gripper_trigger_in.get_lock():
+                        right_gripper_trigger_in.value = tele_data.left_ctrl_triggerValue
+                # -------------------- END DIMENSO ADDITION --------------------
             elif args.ee == "dex1" and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
@@ -366,6 +508,16 @@ if __name__ == '__main__':
                 pass
             with xr_motion_data_ready.get_lock():
                 xr_motion_data_ready.value = tele_data.motion_data_ready
+
+            # ---- DIMENSO ADDITION: thumbstick locomotion (sim) ----
+            # Ungated by --motion and --record on purpose: --motion redirects arms to
+            # rt/arm_sdk which the sim never subscribes to, and current_body_action --
+            # which computes this exact mapping -- is only built inside `if
+            # args.record:`, so it is never available on our path.
+            if args.sim and args.input_mode == "controller":
+                _dv = _dimenso_body_from_sticks(tele_data)
+                _dimenso_publish_body(*_dv)
+            # -------------- END DIMENSO ADDITION --------------
             
             # high level control
             if args.input_mode == "controller" and args.motion:
@@ -390,7 +542,18 @@ if __name__ == '__main__':
             sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
-            arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+            # ---- DIMENSO ADDITION: arms home on scene reset ----
+            # Inside the window opened by a whole-scene reset, command ZERO instead of
+            # the IK solution. Same target as ctrl_dual_arm_go_home(), but applied
+            # through the loop that already owns q_target, so nothing fights it.
+            if _DIMENSO_RESET_FLAG and time.time() < _DIMENSO_RESET_FLAG:
+                arm_ctrl.ctrl_dual_arm(_dimenso_np.zeros(14), _dimenso_np.zeros(14))
+            else:
+                if _DIMENSO_RESET_FLAG:
+                    _DIMENSO_RESET_FLAG = 0.0
+                    logger_mp.info("[dimenso] arms-home window ended; following again")
+                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+            # -------------- END DIMENSO ADDITION --------------
 
             # record data
             if args.record:
@@ -579,6 +742,17 @@ if __name__ == '__main__':
         import traceback
         logger_mp.error(traceback.format_exc())
     finally:
+        # ---- DIMENSO ADDITION: locomotion deadman ----
+        # sharedmemorymanager.read_data() returns the last value FOREVER with no
+        # staleness check, so a stale walk command keeps the robot walking after the
+        # operator has gone. Zero it before anything else in teardown.
+        try:
+            if args.sim:
+                _dimenso_publish_body(0.0, 0.0, 0.0)
+                logger_mp.info("[dimenso] published zero body command (deadman)")
+        except Exception as _e:
+            logger_mp.error(f"[dimenso] deadman publish failed: {_e}")
+        # -------------- END DIMENSO ADDITION --------------
         try:
             arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
