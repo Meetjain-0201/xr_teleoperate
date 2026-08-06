@@ -75,6 +75,219 @@ def get_state() -> dict:
 # cell would not be writable from the callback.
 _DIMENSO_RESET_FLAG = 0.0
 
+# ---------------- DIMENSO ADDITION: collision haptics (DIM-555) ----------------
+# Closes the chain the sim half opened: the robot touches something, PhysX reports
+# it, the sim publishes rt/dimenso/haptics, and the operator's Quest controller taps.
+# Contract is robotics-api docs/superpowers/specs/2026-08-06-collision-haptics-design.md
+# (§3.1 message schema). Full rationale, including the two-copy arrangement for
+# dimenso_haptics_client.py, is in robotics-api
+# docker/isaac-sim-teleop/client-overrides/README.md §6.
+#
+# OFF BY DEFAULT. `DIMENSO_HAPTICS=1` -- the SAME env var that arms the sim-side
+# publisher. One flag for one chain, deliberately: a half-armed chain (client on,
+# sim off) looks exactly like a broken client and is not a state worth being able
+# to reach.
+#
+# THREE THINGS THIS BLOCK HAS TO GET RIGHT, all of them ordering or fail-open:
+#
+# 1. IT IS PRE-FORK, AND THAT IS THE WHOLE CORRECTNESS ARGUMENT.
+#    TeleVuer.__init__ binds the CONTROLLER_MOVE handler (televuer.py:96) and then
+#    forks a daemon child that runs the Vuer server (televuer.py:176-178). So the
+#    monkey-patch and these multiprocessing Values must both exist BEFORE
+#    TeleVuerWrapper(...) is constructed below. Patch it afterwards and only the
+#    parent's copy changes -- the child keeps running the unpatched method and
+#    haptics silently never fires. Same class as "a running backend is not the code
+#    you just committed" (robotics-api GOTCHAS 2026-07-28). Guarded by
+#    tests/test_haptics_client.py::
+#      test_the_client_patches_on_controller_move_BEFORE_constructing_the_wrapper
+#
+# 2. THE PULSE ARRIVES AS AN EVENT, NOT AS PROPS ON MotionControllers.
+#    vuer 0.1.6's browser client destructures pulseLeftStrength / pulseLeftDuration /
+#    pulseLeftHash and the Right three, and then NEVER READS THEM -- they are dead
+#    code, and sending them is a silent no-op. The path that works is
+#    `session @ HapticActuatorPulse(left={"strength":.., "duration":..})`, whose
+#    etype HAPTIC_ACTUATOR_PULSE is the one MotionControllers actually subscribes
+#    to. Because that event is fire-and-forget, onset de-duplication is OURS
+#    (PulseGate) rather than a free edge-trigger off the hash.
+#    The import below is therefore also the VERSION GATE: HapticActuatorPulse does
+#    not exist in vuer 0.0.60, so an old vuer fails loudly here instead of
+#    pretending to work.
+#
+# 3. FAIL-OPEN, NON-NEGOTIABLE. This runs on the same handler that delivers wrist
+#    pose to the arms. Upstream's method is awaited FIRST and outside our try, and
+#    every fault is caught and logged ONCE rather than per-tick at 30 Hz. An
+#    observability hook has already hung a sim control loop (GOTCHAS 2026-08-06).
+_DIMENSO_HAPTICS_ENABLED = os.environ.get("DIMENSO_HAPTICS", "") == "1"
+# Which hand(s). Default LEFT, not right, and not for symmetry with the spec: a
+# shipped Quest Browser regression routed right-hand pulses to the LEFT controller
+# and dropped left entirely (Meta investigation 938861405320634, fixed 2026-03-09).
+# Right-hand-only would be exercising exactly the path that misfires. Set
+# DIMENSO_HAPTICS_SIDES=left,right for the both-hands check, which is mandatory
+# before believing any "wrong hand" report is ours rather than the browser's.
+_DIMENSO_HAPTICS_SIDES = tuple(
+    s.strip() for s in os.environ.get("DIMENSO_HAPTICS_SIDES", "left").split(",") if s.strip()
+)
+_dimenso_haptics = None            # the pure module, or None when off/unavailable
+_DIMENSO_HAPTIC_STATE = None       # {side: {"seq","strength","ms"}} of shared Values
+_dimenso_haptics_gate = None       # PulseGate; the child gets its own copy at fork
+_DimensoHapticPulse = None         # vuer.events.HapticActuatorPulse
+_dimenso_haptics_faults = 0        # so the log line happens once, not 30x a second
+_dimenso_haptics_rx_faults = 0
+_dimenso_haptics_sent = 0
+
+if _DIMENSO_HAPTICS_ENABLED:
+    try:
+        # Sibling of this file, copied from robotics-api client-overrides/. Byte
+        # identity is asserted by tests/test_haptics_client.py so the two cannot
+        # drift the way a regenerated fork silently did in GOTCHAS 2026-08-03.
+        import dimenso_haptics_client as _dimenso_haptics
+        from vuer.events import HapticActuatorPulse as _DimensoHapticPulse
+
+        _DIMENSO_HAPTIC_STATE = {
+            side: {
+                # Monotonic per-side pulse counter -- the edge trigger. Advanced by
+                # the DDS callback in THIS process, read by the Vuer child.
+                "seq": Value('l', 0, lock=True),
+                "strength": Value('d', 0.0, lock=True),
+                "ms": Value('i', 0, lock=True),
+            }
+            for side in _DIMENSO_HAPTICS_SIDES
+        }
+        _dimenso_haptics_gate = _dimenso_haptics.PulseGate(sides=_DIMENSO_HAPTICS_SIDES)
+        logger_mp.info(
+            f"[dimenso] collision haptics ARMED for {list(_DIMENSO_HAPTICS_SIDES)} "
+            f"on {_dimenso_haptics.TOPIC}"
+        )
+    except Exception as _e:
+        # Explicitly NOT fatal. DIMENSO_HAPTICS=1 against a checkout without the
+        # module, or against vuer 0.0.60, must degrade to a teleop session with no
+        # haptics -- never to no teleop session. But it is an ERROR, not a debug
+        # line: the operator asked for haptics and is not getting any.
+        logger_mp.error(
+            f"[dimenso] DIMENSO_HAPTICS=1 but haptics could not initialise ({_e!r}). "
+            "Continuing WITHOUT haptics. If this is an ImportError on "
+            "vuer.events.HapticActuatorPulse, the installed vuer is too old -- pin "
+            "vuer[all]==0.1.6 (0.0.60 has no such event; 0.0.69-0.0.72 vendor a "
+            "pre-haptics browser client and fail silently)."
+        )
+        _dimenso_haptics = None
+        _DIMENSO_HAPTIC_STATE = None
+        _dimenso_haptics_gate = None
+        _DimensoHapticPulse = None
+
+
+def _dimenso_haptics_ready():
+    return (_dimenso_haptics is not None and _DIMENSO_HAPTIC_STATE is not None
+            and _dimenso_haptics_gate is not None and _DimensoHapticPulse is not None)
+
+
+def _dimenso_haptics_ingest(payload):
+    """Latest-wins. Turn one rt/dimenso/haptics message into shared-Value writes.
+
+    Runs on the DDS reader thread, which is the only writer. Pure decisions live in
+    dimenso_haptics_client.select_pulses; this function only moves numbers, so that
+    everything decidable is unit-tested off-headset.
+
+    Returns the sides it advanced, for the tests and for the log line.
+    """
+    global _dimenso_haptics_rx_faults
+    if not _dimenso_haptics_ready():
+        return ()
+    try:
+        pulses = _dimenso_haptics.select_pulses(payload, sides=_DIMENSO_HAPTICS_SIDES)
+        advanced = []
+        for side, spec in pulses.items():
+            slot = _DIMENSO_HAPTIC_STATE.get(side)
+            if slot is None:
+                continue
+            # Values BEFORE the counter. The reader gates on the counter, so bumping
+            # it first would let one controller tick read a fresh seq against a stale
+            # strength -- a pulse at the previous contact's amplitude.
+            slot["strength"].value = float(spec[_dimenso_haptics.KEY_STRENGTH])
+            slot["ms"].value = int(spec[_dimenso_haptics.KEY_DURATION])
+            with slot["seq"].get_lock():
+                slot["seq"].value += 1
+            advanced.append(side)
+        return tuple(advanced)
+    except Exception as _e:
+        _dimenso_haptics_rx_faults += 1
+        if _dimenso_haptics_rx_faults == 1:
+            logger_mp.error(f"[dimenso] haptics ingest fault (logged once): {_e!r}")
+        return ()
+
+
+def _dimenso_haptics_emit(session):
+    """Send at most one HapticActuatorPulse per side, only on a fresh onset.
+
+    Runs in the VUER CHILD process, ~30 Hz, on the handler that also carries wrist
+    pose to the arms. Never raises.
+
+    The gate is what keeps this a tap. Repeated pulse() calls PREEMPT rather than
+    queue, so re-sending an unchanged contact every tick would truncate a 40 ms tap
+    to ~33 ms, every tick -- quieter and buzzier than sending it once.
+    """
+    global _dimenso_haptics_faults, _dimenso_haptics_sent
+    if not _dimenso_haptics_ready():
+        return
+    try:
+        counters = {}
+        for side in _DIMENSO_HAPTICS_SIDES:
+            slot = _DIMENSO_HAPTIC_STATE.get(side)
+            if slot is not None:
+                counters[side] = slot["seq"].value
+        fresh = _dimenso_haptics_gate.take(counters)
+        if not fresh:
+            return
+        pulses = {}
+        for side in fresh:
+            slot = _DIMENSO_HAPTIC_STATE[side]
+            pulses[side] = {
+                _dimenso_haptics.KEY_STRENGTH: slot["strength"].value,
+                _dimenso_haptics.KEY_DURATION: slot["ms"].value,
+            }
+        kwargs = _dimenso_haptics.pulse_kwargs(pulses)
+        if not kwargs:
+            return
+        session @ _DimensoHapticPulse(**kwargs)
+        _dimenso_haptics_sent += 1
+        # The FIRST send is the single most valuable line in this log. It splits
+        # "we never sent anything" from "we sent and nothing was felt" -- and the
+        # latter is a browser question (the 42.3+ controller-haptics permission,
+        # the 2026-03-09 per-hand routing fix, or a Link session, all of which fail
+        # silently), not a question about this code.
+        if _dimenso_haptics_sent == 1:
+            logger_mp.info(f"[dimenso] FIRST haptic pulse sent to the headset: {kwargs}")
+        elif _dimenso_haptics_sent % 100 == 0:
+            logger_mp.info(f"[dimenso] haptic pulses sent: {_dimenso_haptics_sent}")
+    except Exception as _e:
+        _dimenso_haptics_faults += 1
+        if _dimenso_haptics_faults == 1:
+            logger_mp.error(f"[dimenso] haptics emit fault (logged once): {_e!r}")
+
+
+def _dimenso_patch_televuer_for_haptics():
+    """Wrap TeleVuer.on_controller_move. MUST be called before TeleVuerWrapper(...).
+
+    A wrap rather than a second add_handler("CONTROLLER_MOVE") registration: Vuer
+    stores handlers as a dict of dicts so both work, but wrapping guarantees our
+    send happens AFTER the pose has been written to shared memory on the very same
+    tick, with no second dispatch to order against.
+    """
+    if not _dimenso_haptics_ready():
+        return False
+    from televuer import TeleVuer as _DimensoTeleVuer
+    _orig = _DimensoTeleVuer.on_controller_move
+
+    async def _dimenso_on_controller_move(self, event, session, fps=60):
+        # Upstream FIRST, and outside the try: this is the arm/pose path, and its
+        # own behaviour (including how it handles a bad event) must be untouched.
+        await _orig(self, event, session, fps=fps)
+        _dimenso_haptics_emit(session)
+
+    _DimensoTeleVuer.on_controller_move = _dimenso_on_controller_move
+    return True
+# ------------------------- END DIMENSO ADDITION -----------------------------
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -126,6 +339,28 @@ if __name__ == '__main__':
         camera_config = img_client.get_cam_config()
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
+
+        # ---- DIMENSO ADDITION: collision haptics -- patch BEFORE the fork ----
+        # TeleVuer.__init__ binds the CONTROLLER_MOVE handler and then starts a daemon
+        # child process (televuer.py:96, :176-178). Applied one statement earlier than
+        # the construction below and NOT a line later: after the fork this would only
+        # rebind the parent's copy of the method, the Vuer child would keep running
+        # upstream's, and haptics would silently never fire with nothing in any log to
+        # say so. See the module-level block for the full rationale.
+        #
+        # Controller input only -- on_controller_move is not even registered in
+        # hand-tracking mode (televuer.py:93-96), and bare hands have no haptic
+        # actuator to pulse (inputSource.gamepad is null for optical hand tracking).
+        if _DIMENSO_HAPTICS_ENABLED:
+            if args.input_mode != "controller":
+                logger_mp.warning(
+                    "[dimenso] DIMENSO_HAPTICS=1 ignored: --input-mode is "
+                    f"'{args.input_mode}', and hand tracking exposes no haptic actuator. "
+                    "Run with --input-mode controller."
+                )
+            elif _dimenso_patch_televuer_for_haptics():
+                logger_mp.info("[dimenso] TeleVuer.on_controller_move wrapped for haptics")
+        # ---------------------- END DIMENSO ADDITION ----------------------
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
         tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
@@ -381,6 +616,41 @@ if __name__ == '__main__':
             except Exception as _e:
                 logger_mp.error(f"[dimenso] could not subscribe to rt/reset_pose/cmd: {_e}")
         # ------------------------- END DIMENSO ADDITION -----------------------------
+
+        # ---- DIMENSO ADDITION: collision haptics subscriber (DIM-555) ----
+        # Deliberately created AFTER TeleVuerWrapper, unlike the monkey-patch above.
+        # A DDS reader spawns its own listener thread, and threads do not survive
+        # fork() -- creating it earlier would leave the Vuer child holding a copy of
+        # the reader's file descriptors with nothing servicing them. The reset
+        # subscriber above already proves this position works. Only the shared Values
+        # and the patch have to be pre-fork; the SUBSCRIBER must not be.
+        #
+        # Domain is untouched: this reuses the participant ChannelFactoryInitialize
+        # already created for domain 1 (sim). There is no ChannelFactoryInitialize
+        # here, so no code path in this hunk can reach domain 0 -- the physical G1.
+        if args.sim and _DIMENSO_HAPTICS_ENABLED and _dimenso_haptics_ready():
+            try:
+                from unitree_sdk2py.core.channel import ChannelSubscriber as _DimensoSub
+
+                def _dimenso_on_haptics(msg):
+                    # Never raises: _dimenso_haptics_ingest catches everything and
+                    # logs once. A DDS callback that throws is a fail-open violation.
+                    _dimenso_haptics_ingest(getattr(msg, "data", None))
+
+                _dimenso_haptics_sub = _DimensoSub(_dimenso_haptics.TOPIC, _DimensoStr)
+                # queue depth 1: latest-wins. A contact is only interesting while it is
+                # current, and a backlog of onsets would replay stale taps after the
+                # operator has already moved on.
+                _dimenso_haptics_sub.Init(_dimenso_on_haptics, 1)
+                logger_mp.info(
+                    f"[dimenso] subscribed to {_dimenso_haptics.TOPIC} for collision haptics"
+                )
+            except Exception as _e:
+                logger_mp.error(
+                    f"[dimenso] could not subscribe to {_dimenso_haptics.TOPIC}: {_e!r} "
+                    "-- continuing WITHOUT haptics"
+                )
+        # -------------- END DIMENSO ADDITION --------------
 
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.

@@ -2,3 +2,39 @@ matplotlib==3.7.5
 rerun-sdk==0.20.1
 meshcat==0.3.2
 sshkeyboard==2.3.1
+
+# DIMENSO ADDITION: collision haptics (DIM-555).
+#
+# Pinned HERE and not in teleop/televuer/pyproject.toml, which is where the
+# transitive `vuer[all]==0.0.60` comes from: televuer is the one submodule still on
+# VANILLA UPSTREAM (unitreerobotics/televuer, no `fork` remote), so editing it means
+# forking it and bumping two levels of submodule gitlink. This pin gets the same
+# result without that commitment. It must WIN over televuer's -- install it
+# explicitly after, and expect pip to report the conflict:
+#
+#   pip install -r requirements.txt
+#   pip install --upgrade 'vuer[all]==0.1.6'      # overrides televuer's ==0.0.60
+#
+# WHY 0.1.6 EXACTLY, AND WHY NOT THE OBVIOUS EARLIER ONES:
+# The pip package and the browser client are versioned separately -- the client is
+# the npm package @vuer-ai/vuer, vendored into pip's client_build/. Haptics landed in
+# the repo 2025-11-23, but the first pip release after that (0.0.69, 2025-12-11)
+# vendors client 0.0.96 (2025-10-11), which PREDATES the feature. So 0.0.69-0.0.72
+# ship the new Python API against an old browser client and fail SILENTLY: the event
+# serialises, ships, and nothing acts on it. Do not "downgrade to save a few
+# releases".
+#
+# 0.1.6 is verified, not inferred. Read out of the wheel:
+#   * vuer/events.py:276 defines HapticActuatorPulse, etype HAPTIC_ACTUATOR_PULSE
+#   * client_build/assets/chunks/chunk-B_1l0x81.js has MotionControllers subscribing
+#     to that etype and calling hapticActuators[0].pulse(strength, duration)
+# The installed 0.0.60 has neither -- the event class does not exist, so the client's
+# import is the version gate and fails loudly at startup.
+#
+# KNOWN RISK, stated rather than discovered later: 0.0.60 -> 0.1.6 is ~25 releases
+# across a 0.0.x -> 0.1.x boundary on an alpha-status package, and this is the FPV /
+# pose path that currently works. Regression-check ImageBackground still renders,
+# CONTROLLER_MOVE still streams, and pose still reaches the arms before trusting a
+# haptics result. See robotics-api
+# docker/isaac-sim-teleop/client-overrides/README.md §6.
+vuer[all]==0.1.6
