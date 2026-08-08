@@ -125,7 +125,9 @@ _DIMENSO_HAPTICS_ENABLED = os.environ.get("DIMENSO_HAPTICS", "") == "1"
 # DIMENSO_HAPTICS_SIDES=left,right for the both-hands check, which is mandatory
 # before believing any "wrong hand" report is ours rather than the browser's.
 _DIMENSO_HAPTICS_SIDES = tuple(
-    s.strip() for s in os.environ.get("DIMENSO_HAPTICS_SIDES", "left").split(",") if s.strip()
+    # P3: BOTH hands. "left" was the P2 vertical slice, and reverting an unrelated change
+    # silently took the operator back to it -- one hand, whatever he touched.
+    s.strip() for s in os.environ.get("DIMENSO_HAPTICS_SIDES", "left,right").split(",") if s.strip()
 )
 _dimenso_haptics = None            # the pure module, or None when off/unavailable
 _DIMENSO_HAPTIC_STATE = None       # {side: {"seq","strength","ms"}} of shared Values
@@ -194,7 +196,10 @@ def _dimenso_haptics_ingest(payload):
     if not _dimenso_haptics_ready():
         return ()
     try:
-        pulses = _dimenso_haptics.select_pulses(payload, sides=_DIMENSO_HAPTICS_SIDES)
+        # onset_only=False: P3 sends sustain and release events too, so held contact
+        # keeps a low buzz instead of going silent after the first tap.
+        pulses = _dimenso_haptics.select_pulses(
+            payload, sides=_DIMENSO_HAPTICS_SIDES, onset_only=False)
         advanced = []
         for side, spec in pulses.items():
             slot = _DIMENSO_HAPTIC_STATE.get(side)
@@ -334,6 +339,39 @@ if __name__ == '__main__':
                                                       daemon=True)
             listen_keyboard_thread.start()
 
+        # ---- DIMENSO ADDITION (DIM-547): wrist views on their OWN thread -------------
+        # NEVER in the control loop -- an inline fetch stalled teleop on a live session.
+        def _dimenso_wrist_pump(client, wrapper, cfg):
+            import threading, time as _t
+            enabled = {"left":  bool(cfg.get("left_wrist_camera", {}).get("enable_zmq")),
+                       "right": bool(cfg.get("right_wrist_camera", {}).get("enable_zmq"))}
+            if not any(enabled.values()):
+                return
+            getters = {"left": client.get_left_wrist_frame, "right": client.get_right_wrist_frame}
+            faults = {"left": 0, "right": 0}
+            MAX_FAULTS = 30
+
+            def run():
+                logger_mp.info("[dimenso] wrist panel pump up (%s)",
+                               ", ".join(k for k, v in enabled.items() if v))
+                while True:
+                    for side, on in enabled.items():
+                        if not on or faults[side] >= MAX_FAULTS:
+                            continue
+                        try:
+                            f = getters[side]()
+                            if f is not None and f.bgr is not None:
+                                wrapper.render_wrist_to_xr(side, f.bgr)
+                                faults[side] = 0
+                        except Exception:
+                            faults[side] += 1
+                            if faults[side] == MAX_FAULTS:
+                                logger_mp.warning("[dimenso] %s wrist panel disabled after %d "
+                                                  "errors; teleop unaffected", side, MAX_FAULTS)
+                    _t.sleep(0.1)
+            threading.Thread(target=run, daemon=True, name="dimenso-wrist-pump").start()
+        # ---------------------- END DIMENSO ADDITION --------------------------------
+
         # image client
         img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
         camera_config = img_client.get_cam_config()
@@ -375,6 +413,11 @@ if __name__ == '__main__':
                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
                                      arm_reference_mode="head_yaw"
                                      )
+
+        # DIM-547: pump starts AFTER the wrapper, never inside the loop.
+        if os.environ.get("DIMENSO_WRIST_PANELS", "1").strip().lower() not in ("0","false","no"):
+            _dimenso_wrist_pump(img_client, tv_wrapper, camera_config)
+
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
         if args.motion:

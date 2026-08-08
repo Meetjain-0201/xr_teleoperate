@@ -109,6 +109,10 @@ SIDE_BOTH = "both"
 ZONE_FINGER = "finger"
 ZONE_WRIST = "wrist"
 ZONE_BODY = "body"
+# DIM-546 follow-up: arms and legs are their own zones. Meet: "body is not just torso, its
+# legs and everything" -- an elbow knock and a knee into a table used to reach nobody.
+ZONE_ARM = "arm"
+ZONE_LEG = "leg"
 
 # The etype Vuer's client actually subscribes to, and the two payload keys it reads.
 EVENT_ETYPE = "HAPTIC_ACTUATOR_PULSE"
@@ -136,8 +140,17 @@ MIN_DURATION_MS = 0
 MAX_DURATION_MS = 5000
 
 # P2 slice: one zone, one hand. See "WHY LEFT AND NOT RIGHT" above.
-P2_SIDES = (SIDE_LEFT,)
-P2_ZONES = (ZONE_FINGER,)
+# P3 (DIM-546). P2 shipped ONE hand and ONE zone to prove the chain, and Meet's first live
+# test found exactly that: "it needs to be properly directed to the hand being touched, and if
+# its body then both". The sim already classified all of this; this filter was the only thing
+# throwing it away.
+P3_SIDES = (SIDE_LEFT, SIDE_RIGHT, SIDE_BOTH)
+P3_ZONES = (ZONE_FINGER, ZONE_WRIST, ZONE_ARM, ZONE_LEG, ZONE_BODY)
+# The P2 names stay as aliases: they are referenced by the shipped tests and by the client
+# patch, and a rename that breaks an import is a silently disarmed haptics chain -- the exact
+# failure mode this whole feature keeps producing.
+P2_SIDES = P3_SIDES
+P2_ZONES = P3_ZONES
 
 
 def clamp_strength(value):
@@ -247,7 +260,8 @@ def select_pulses(payload, sides=P2_SIDES, zones=P2_ZONES, onset_only=True):
     zones = tuple(zones)
     out = {}
     for event in msg["events"]:
-        if event.get("side") not in sides:
+        side = event.get("side")
+        if side not in sides:
             continue
         if event.get("zone") not in zones:
             continue
@@ -260,9 +274,14 @@ def select_pulses(payload, sides=P2_SIDES, zones=P2_ZONES, onset_only=True):
         # tick sending a guaranteed no-op.
         if strength <= MIN_STRENGTH or duration <= MIN_DURATION_MS:
             continue
-        prev = out.get(event.get("side"))
-        if prev is None or strength > prev[KEY_STRENGTH]:
-            out[event.get("side")] = {KEY_STRENGTH: strength, KEY_DURATION: duration}
+        # P3: an unsided contact (torso, waist, pelvis -- SIDE_BOTH per 3.2) reaches BOTH
+        # hands. This is Meet's "if its body then both", and it is the one place where one
+        # event legitimately becomes two pulses.
+        targets = (SIDE_LEFT, SIDE_RIGHT) if side == SIDE_BOTH else (side,)
+        for target in targets:
+            prev = out.get(target)
+            if prev is None or strength > prev[KEY_STRENGTH]:
+                out[target] = {KEY_STRENGTH: strength, KEY_DURATION: duration}
     return out
 
 
