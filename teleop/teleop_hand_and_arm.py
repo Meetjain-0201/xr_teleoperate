@@ -346,21 +346,76 @@ if __name__ == '__main__':
             enabled = {"left":  bool(cfg.get("left_wrist_camera", {}).get("enable_zmq")),
                        "right": bool(cfg.get("right_wrist_camera", {}).get("enable_zmq"))}
             if not any(enabled.values()):
+                # 2026-08-11: SAY SO. This used to be a bare `return`.
+                #
+                # Meet, in the headset: "why are wrist cameras not appearing in teleop, check
+                # and this error should not repeat". The cause was not placement and not this
+                # client -- it was `ISAAC_WRIST_CAMERAS` unset on the backend, which leaves the
+                # sim's cam_config_server.yaml at `enable_zmq: false` for both wrists and never
+                # spawns the CameraCfgs. `cfg` here comes from the IMAGE SERVER over ZMQ
+                # (img_client.get_cam_config()), so this dict is the box's own answer.
+                #
+                # The defect worth fixing permanently is that the operator saw one frame and
+                # NOTHING anywhere said why -- not this log, not the sim's, not the backend's.
+                # A silent `return` on a feature the operator is actively looking for is the
+                # same class as every other "correct code, absent call site" trap here.
+                logger_mp.warning(
+                    "[dimenso] WRIST PANELS OFF: the image server reports enable_zmq=false "
+                    "for BOTH wrist cameras, so no wrist frames exist to draw and only the "
+                    "head view will appear. This is a LAUNCH-TIME setting and cannot be "
+                    "changed on a running session: set ISAAC_WRIST_CAMERAS=1 in "
+                    "robotics-api/.env and relaunch the Isaac session (one flag drives both "
+                    "the CameraCfg spawn and this ZMQ publish). Teleop is otherwise "
+                    "unaffected."
+                )
                 return
+            if not all(enabled.values()):
+                logger_mp.warning(
+                    "[dimenso] only the %s wrist stream is published; the other panel will "
+                    "stay absent. Both come from one flag, so this means the box's "
+                    "cam_config_server.yaml was edited by hand rather than rendered.",
+                    ", ".join(k for k, v in enabled.items() if v),
+                )
             getters = {"left": client.get_left_wrist_frame, "right": client.get_right_wrist_frame}
             faults = {"left": 0, "right": 0}
             MAX_FAULTS = 30
 
+            # 2026-08-11. A frame that never ARRIVES raises nothing, so the fault counter above
+            # cannot see it: `getters[side]()` simply returns None forever and the panel stays
+            # blank. That is the exact half-configured state isaac_cam_config's docstring warns
+            # about -- "the image server advertises a stream that never produces a frame, and
+            # the client waits on it" -- i.e. ZMQ published but the CameraCfg not spawned. One
+            # line, once per side, so a blank panel is never mistaken for a placement bug again.
+            seen = {"left": False, "right": False}
+            starved_reported = {"left": False, "right": False}
+            STARVED_AFTER = 100          # x 0.1s sleep = ~10s, well past Isaac's first frames
+
             def run():
                 logger_mp.info("[dimenso] wrist panel pump up (%s)",
                                ", ".join(k for k, v in enabled.items() if v))
+                loops = 0
                 while True:
+                    loops += 1
                     for side, on in enabled.items():
                         if not on or faults[side] >= MAX_FAULTS:
                             continue
+                        if (loops >= STARVED_AFTER and not seen[side]
+                                and not starved_reported[side]):
+                            starved_reported[side] = True
+                            logger_mp.warning(
+                                "[dimenso] %s wrist stream is PUBLISHED but has produced no "
+                                "frame in ~%.0fs -- the panel will be blank. This is the "
+                                "half-configured state: enable_zmq is true on the box while "
+                                "the wrist CameraCfg was not spawned. Both halves come from "
+                                "ISAAC_WRIST_CAMERAS; a mismatch means the box's config was "
+                                "hand-edited instead of rendered.", side, STARVED_AFTER * 0.1)
                         try:
                             f = getters[side]()
                             if f is not None and f.bgr is not None:
+                                if not seen[side]:
+                                    seen[side] = True
+                                    logger_mp.info(
+                                        "[dimenso] %s wrist panel: first frame received", side)
                                 wrapper.render_wrist_to_xr(side, f.bgr)
                                 faults[side] = 0
                         except Exception:
