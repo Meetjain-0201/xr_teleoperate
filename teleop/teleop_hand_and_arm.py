@@ -672,6 +672,10 @@ if __name__ == '__main__':
         # both of those for Damp(). The hold requirement is so a brushed button
         # cannot engage a robot.
         _DIMENSO_ENGAGE_TICKS = 12          # x 0.033s ~= 0.4s
+        # DIM-657: the walking-mode quit (right A) must not fire on the button
+        # press that ENGAGED. False until right A is observed released. See the
+        # block at the quit check for the measurement.
+        _dimenso_quit_armed = False
         _dimenso_engage_held = 0
 
         # ---- DIMENSO ADDITION: arms home on scene reset ----
@@ -889,10 +893,32 @@ if __name__ == '__main__':
             
             # high level control
             if args.input_mode == "controller" and args.motion:
-                # quit teleoperate
-                if tele_data.right_ctrl_aButton:
+                # ---- DIMENSO ADDITION (DIM-657): ARM THE QUIT ONLY AFTER RELEASE ----
+                # MEASURED on Hercules 2026-08-27 13:13: engaging in walking mode
+                # quit the client INSTANTLY. The log reads
+                #     🚀start Tracking🚀
+                #     ctrl_dual_arm_go_home start...
+                # ~0s apart, so walking never ran a single tick.
+                #
+                # Two bindings collide, and both are correct on their own:
+                #   :763 (DIMENSO)  engage = left A AND right A held ~0.4 s
+                #   :893 (upstream) quit   = right A alone
+                # Engage necessarily EXITS with right A still down, so the first
+                # pass of this loop reads it as a quit. The two features are
+                # unusable together as written.
+                #
+                # Fixed by edge-triggering instead of level-triggering: the quit
+                # arms only once right A has been seen RELEASED. Upstream's quit
+                # still works exactly as before on the second press -- nothing is
+                # removed, and a genuine quit is one deliberate press away.
+                if not _dimenso_quit_armed:
+                    if not tele_data.right_ctrl_aButton:
+                        _dimenso_quit_armed = True
+                elif tele_data.right_ctrl_aButton:
+                    logger_mp.info("[dimenso] right A pressed -- quitting")
                     START = False
                     STOP = True
+                # ---------------------- END DIMENSO ADDITION ----------------------
                 # command robot to enter damping mode. soft emergency stop function
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
                     loco_wrapper.Damp()
