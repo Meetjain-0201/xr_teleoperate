@@ -138,20 +138,44 @@ class Brainco_Controller_ctrl:
                 if xr_motion_data_ready:
                     # In the official document, the angles are in the range [0, 1] ==> 0.0: fully open  1.0: fully closed
                     left_triger_value = (10.0 - left_trigger_value) / 10.0
-                    left_q_target[0]  = np.clip((left_triger_value - 0.5) / 0.5, 0.0, 0.98) # thumb-aux
-                    left_q_target[1]  = np.clip(left_triger_value / 0.5, 0.0, 0.7) # thumb
-                    left_q_target[2]  = np.clip(left_squeeze_value, 0.0, 0.98)                   # index
-                    left_q_target[3]  = np.clip(left_triger_value, 0.0, 0.98)   # middle
-                    left_q_target[4]  = np.clip(left_triger_value, 0.0, 0.98)   # ring
-                    left_q_target[5]  = np.clip(left_triger_value, 0.0, 0.98)   # pinky
-
                     right_triger_value = (10.0 - right_trigger_value) / 10.0
-                    right_q_target[0] = np.clip((right_triger_value - 0.5) / 0.5, 0.0, 0.98)
-                    right_q_target[1] = np.clip(right_triger_value / 0.5, 0.0, 0.7)
-                    right_q_target[2] = np.clip(right_squeeze_value, 0.0, 0.98)                  # index
-                    right_q_target[3] = np.clip(right_triger_value, 0.0, 0.98)  # middle
-                    right_q_target[4] = np.clip(right_triger_value, 0.0, 0.98)  # ring
-                    right_q_target[5] = np.clip(right_triger_value, 0.0, 0.98)  # pinky
+                    # ---- DIMENSO ADDITION (DIM-657): FOUR FINGERS TOGETHER, THUMB SEPARATE ----
+                    # Meet, after the first live hands test: "let the thumb close on grip,
+                    # the 4 fingers go together, the thumb is essential and should work
+                    # separately."
+                    #
+                    # UPSTREAM MAPPING, kept here so it can be restored exactly:
+                    #     q[0] thumb-aux = clip((trigger-0.5)/0.5, 0, 0.98)
+                    #     q[1] thumb     = clip(trigger/0.5,       0, 0.70)
+                    #     q[2] index     = clip(SQUEEZE,           0, 0.98)
+                    #     q[3..5]        = clip(trigger,           0, 0.98)
+                    #
+                    # That put the INDEX on the grip button and the thumb on the trigger,
+                    # so pulling the trigger closed five motors and left the index open --
+                    # which is exactly what was observed on the robot and read as a broken
+                    # finger. It is not opposable-grasp shaped: a thumb that closes with
+                    # the fingers cannot pinch against them.
+                    #
+                    # SWAPPED: the two THUMB motors move to the grip button, and the index
+                    # joins middle/ring/pinky on the trigger. The response CURVES are
+                    # unchanged -- only which signal feeds them -- so the per-motor limits
+                    # still hold (idx0 0~1.52 rad, idx1 0~1.05, idx2..5 0~1.47, normalised).
+                    # The staged thumb-aux (nothing until half-pressed, so the thumb rotates
+                    # in before it flexes) is preserved on the new input.
+                    left_q_target[0]  = np.clip((left_squeeze_value - 0.5) / 0.5, 0.0, 0.98)  # thumb-aux <- GRIP
+                    left_q_target[1]  = np.clip(left_squeeze_value / 0.5, 0.0, 0.7)           # thumb     <- GRIP
+                    left_q_target[2]  = np.clip(left_triger_value, 0.0, 0.98)   # index  <- TRIGGER
+                    left_q_target[3]  = np.clip(left_triger_value, 0.0, 0.98)   # middle <- TRIGGER
+                    left_q_target[4]  = np.clip(left_triger_value, 0.0, 0.98)   # ring   <- TRIGGER
+                    left_q_target[5]  = np.clip(left_triger_value, 0.0, 0.98)   # pinky  <- TRIGGER
+
+                    right_q_target[0] = np.clip((right_squeeze_value - 0.5) / 0.5, 0.0, 0.98) # thumb-aux <- GRIP
+                    right_q_target[1] = np.clip(right_squeeze_value / 0.5, 0.0, 0.7)          # thumb     <- GRIP
+                    right_q_target[2] = np.clip(right_triger_value, 0.0, 0.98)  # index  <- TRIGGER
+                    right_q_target[3] = np.clip(right_triger_value, 0.0, 0.98)  # middle <- TRIGGER
+                    right_q_target[4] = np.clip(right_triger_value, 0.0, 0.98)  # ring   <- TRIGGER
+                    right_q_target[5] = np.clip(right_triger_value, 0.0, 0.98)  # pinky  <- TRIGGER
+                    # ---- END DIMENSO ADDITION ----
 
                 # get dual hand state
                 action_data = np.concatenate((left_q_target, right_q_target))
