@@ -911,11 +911,37 @@ if __name__ == '__main__':
                 # arms only once right A has been seen RELEASED. Upstream's quit
                 # still works exactly as before on the second press -- nothing is
                 # removed, and a genuine quit is one deliberate press away.
+                # RIGHT A ALONE, never as half of the engage combo. Measured
+                # 2026-08-27 13:29: release-arming alone was not enough, because
+                # engage is left A + right A -- so the NEXT engage attempt quit on
+                # its right-A half and re-engaging was impossible. Requiring left A
+                # to be UP disambiguates the two bindings completely:
+                #     left A + right A  -> engage (:763)
+                #     right A alone     -> quit   (here)
+                # ARM ONLY FROM A CLEAN NEUTRAL -- BOTH A buttons up.
+                #
+                # Measured 2026-08-27 13:30, and this is the third attempt at
+                # this binding, so the reasoning is written out. During the
+                # engage combo BOTH A's are down, so `right and not left` is
+                # already False -- which armed the quit on the very first loop
+                # pass. Releasing left A a fraction before right A then reads as
+                # "right alone" and quits. Human releases are never simultaneous,
+                # so that fired every time.
+                #
+                # Requiring BOTH up to arm means an asymmetric release cannot
+                # arm it, and the quit only becomes live once the operator's
+                # thumbs are genuinely off the buttons.
+                _dimenso_quit_pressed = (
+                    tele_data.right_ctrl_aButton and not tele_data.left_ctrl_aButton
+                )
+                _dimenso_a_neutral = (
+                    not tele_data.right_ctrl_aButton and not tele_data.left_ctrl_aButton
+                )
                 if not _dimenso_quit_armed:
-                    if not tele_data.right_ctrl_aButton:
+                    if _dimenso_a_neutral:
                         _dimenso_quit_armed = True
-                elif tele_data.right_ctrl_aButton:
-                    logger_mp.info("[dimenso] right A pressed -- quitting")
+                elif _dimenso_quit_pressed:
+                    logger_mp.info("[dimenso] right A alone -- quitting")
                     START = False
                     STOP = True
                 # ---------------------- END DIMENSO ADDITION ----------------------
