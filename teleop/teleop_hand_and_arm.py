@@ -36,6 +36,11 @@ STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
+# DIMENSO ADDITION (DIM-548): throw the in-progress take away instead of saving
+# it. Set by the left B button (and by 'd' on the keyboard); consumed in the main
+# loop next to RECORD_TOGGLE, because the recorder is not thread-safe and every
+# other mutation of its state happens there.
+RECORD_DISCARD = False
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -49,7 +54,7 @@ RECORD_TOGGLE  = False  # Toggle recording state
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE
+    global STOP, START, RECORD_TOGGLE, RECORD_DISCARD
     if key == 'r':
         START = True
     elif key == 'q':
@@ -57,6 +62,10 @@ def on_press(key):
         STOP = True
     elif key == 's' and START == True:
         RECORD_TOGGLE = True
+    # DIMENSO ADDITION (DIM-548): keyboard twin of the left B button, so the
+    # discard path is reachable and testable without a headset on.
+    elif key == 'd' and START == True:
+        RECORD_DISCARD = True
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -609,9 +618,24 @@ if __name__ == '__main__':
         logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
+            logger_mp.info("🟠  Press [d] to DISCARD the take in progress.")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
+        # ---- DIMENSO ADDITION (DIM-548): print the CONTROLLER bindings too ----
+        # GOTCHAS 2026-08-07 (b): read the component's own startup banner. An
+        # operator about to put a headset on cannot read the source, and these
+        # bindings exist precisely so nobody has to reach the keyboard above.
+        if args.input_mode == "controller":
+            logger_mp.info("--------------------- headset controller ----------------------")
+            logger_mp.info("🎮  Hold BOTH A (~0.4s)      -- engage / start following")
+            logger_mp.info("🎮  Right A alone            -- quit")
+            logger_mp.info("🎮  Click BOTH thumbsticks   -- STOP walking (still balancing)")
+            logger_mp.info("                                NOT a damp; L1+A on the remote is the e-stop")
+            if args.record:
+                logger_mp.info("🎮  Right B (tap)            -- START / SAVE episode")
+                logger_mp.info("🎮  Left  B (HOLD ~0.4s)     -- DISCARD this take, retake the same id")
+        # ---------------------- END DIMENSO ADDITION ----------------------
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         # ---------------- DIMENSO ADDITION: sim locomotion publisher ----------------
         # rt/run_command/cmd is what unitree_sim_isaaclab's wholebody action provider
@@ -682,6 +706,12 @@ if __name__ == '__main__':
         # is held so the StopMove RPC fires once per press instead of every tick at
         # ~90 Hz. See the block at the stop check.
         _dimenso_stick_stop_latched = False
+        # DIM-548: controller recording bindings. Right B taps to start/save, left B
+        # is HELD to discard -- the destructive action is the harder one on purpose.
+        # See the block just after get_tele_data().
+        _dimenso_save_was_down = False
+        _dimenso_discard_held = 0
+        _DIMENSO_DISCARD_TICKS = _DIMENSO_ENGAGE_TICKS   # ~0.4 s, same feel as engage
 
         # ---- DIMENSO ADDITION: arms home on scene reset ----
         # A whole-scene reset restores the robot and the objects, but the ARMS are
@@ -828,8 +858,91 @@ if __name__ == '__main__':
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
 
+            # ---- DIMENSO ADDITION (DIM-548): DISCARD THE TAKE FROM THE CONTROLLER ----
+            # The counterpart to RECORD_TOGGLE above. Upstream can only create and
+            # save, so a fluffed take had to be saved and then deleted from a
+            # terminal afterwards -- impossible in a headset, and a bad episode that
+            # reaches the dataset is worse than no episode, because nothing
+            # downstream can tell a fumbled grasp from a good one.
+            #
+            # Handled HERE rather than in the button handler because everything that
+            # mutates recorder state lives in this one place in the loop, and the
+            # writer is not thread-safe. The button only sets a flag.
+            if args.record and RECORD_DISCARD:
+                RECORD_DISCARD = False
+                if RECORD_RUNNING:
+                    RECORD_RUNNING = False
+                    recorder.discard_episode()
+                    if args.sim:
+                        publish_reset_category(1, reset_pose_publisher)
+                else:
+                    logger_mp.warning("[dimenso] discard pressed with no episode running -- ignored.")
+            # ---------------------- END DIMENSO ADDITION ----------------------
+
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+
+            # ---- DIMENSO ADDITION (DIM-548): RECORDING FROM THE CONTROLLER ----
+            # THE POINT: an operator in a headset cannot reach a keyboard. Before
+            # this, every episode boundary needed someone at the terminal pressing
+            # 's', which meant a one-person recording session was impossible -- the
+            # person wearing the headset is the person performing the task.
+            #
+            #   RIGHT B, tap    -> start the episode / save it and finish (the same
+            #                      toggle cycle the 's' key drives)
+            #   LEFT  B, HOLD   -> discard the take and free the id for a retake
+            #
+            # WHY THE B BUTTONS. They are the only controller inputs this client
+            # does not already read. Measured against televuer's field list: the
+            # triggers and grips drive the fingers, the thumbstick AXES drive
+            # walking, the thumbstick CLICKS are the stop combo, and both A buttons
+            # are engage/quit. B was the entire remaining budget.
+            #
+            # SAVE IS A TAP, DISCARD IS A HOLD, and the asymmetry is deliberate:
+            # discard destroys work irreversibly, so it should be harder to trigger
+            # than the thing you do after every good take. Same ~0.4 s hold as
+            # engage, and reusing that number rather than inventing a second one.
+            #
+            # EDGE-TRIGGERED, and for the save that is load-bearing rather than an
+            # optimisation: this loop runs at ~30 Hz, so a level-triggered save
+            # would toggle recording on and off thirty times a second for as long
+            # as a thumb rested on the button.
+            #
+            # THE FLAGS ARE CONSUMED ON THE NEXT PASS, not here. The record block
+            # sits ABOVE this one in the loop, so a flag set now is acted on ~33 ms
+            # later. That is deliberate: every mutation of recorder state happens in
+            # that one block, and the writer is not thread-safe.
+            #
+            # GATED ON `args.record`. Without it these buttons are inert rather than
+            # silently setting flags nothing will ever read.
+            if args.record and args.input_mode == "controller":
+                _b_save = tele_data.right_ctrl_bButton
+                _b_discard = tele_data.left_ctrl_bButton
+
+                # ---- right B: tap to start / save ----
+                if _b_save and not _dimenso_save_was_down:
+                    RECORD_TOGGLE = True
+                    logger_mp.info(
+                        "[dimenso] right B -- %s",
+                        "SAVING episode" if RECORD_RUNNING else "STARTING episode",
+                    )
+                _dimenso_save_was_down = _b_save
+
+                # ---- left B: hold to discard ----
+                if _b_discard:
+                    _dimenso_discard_held += 1
+                    if _dimenso_discard_held == _DIMENSO_DISCARD_TICKS:
+                        # Fires exactly once per hold: == rather than >=, so
+                        # continuing to hold cannot re-arm it.
+                        if RECORD_RUNNING:
+                            RECORD_DISCARD = True
+                            logger_mp.warning("[dimenso] left B held -- DISCARDING this take")
+                        else:
+                            logger_mp.info("[dimenso] left B held, but no episode is running")
+                else:
+                    _dimenso_discard_held = 0
+            # ---------------------- END DIMENSO ADDITION ----------------------
+
             if args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()

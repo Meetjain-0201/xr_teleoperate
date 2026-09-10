@@ -3,6 +3,7 @@ import cv2
 import json
 import datetime
 import numpy as np
+import shutil          # DIMENSO ADDITION: discard_episode() removes the episode dir
 import time
 from .rerun_visualizer import RerunLogger
 from queue import Queue, Empty
@@ -219,6 +220,76 @@ class EpisodeWriter():
         self.need_save = False     # Reset the save flag
         self.is_available = True   # Mark the class as available after saving
         logger_mp.info(f"==> Episode saved successfully to {self.json_path}.")
+
+    # ---------------------------- DIMENSO ADDITION ----------------------------
+    def discard_episode(self):
+        """Throw the in-progress episode away: delete it from disk and free the
+        writer for the next take. Returns True if something was discarded.
+
+        WHY THIS EXISTS. Upstream offers create/save and nothing else, so a
+        fluffed take had to be saved and deleted afterwards from a terminal. An
+        operator in a headset cannot do that, and a bad episode that reaches the
+        dataset is worse than no episode -- DIM-548's readiness checks cannot
+        tell a fumbled grasp from a good one. Retake has to be reachable from the
+        controller, so it has to exist here first.
+
+        THE QUEUE IS DRAINED BEFORE ANYTHING ELSE HAPPENS, and that ordering is
+        the whole correctness argument. `add_item` only ENQUEUES; a worker thread
+        writes the JPEGs and appends the JSON afterwards.
+
+        MEASURED 2026-09-10, because the first version of this docstring asserted
+        a mechanism that turned out to be FALSE. It claimed the worker would
+        recreate the deleted directory via `cv2.imwrite`. It does not -- neither
+        `cv2.imwrite` nor `open(..., "a")` creates parent directories, so the
+        delete sticks and the stragglers just log failures.
+
+        The real hazard is CROSS-TAKE CONTAMINATION, and it is worse. Look at
+        `_process_item_data`: it reads `self.color_dir` and `self.json_path` at
+        PROCESSING time, not at enqueue time, and `create_episode()` reassigns
+        both. So an item queued for the discarded take but processed after the
+        operator has started the RETAKE is written into the retake's directory.
+
+        Measured with a deliberately slowed writer -- discard a 20-frame take,
+        immediately start a 3-frame retake:
+
+            without the drain -> the retake contains 20 frames   CONTAMINATED
+            with    the drain -> the retake contains  3 frames   clean
+
+        That is a thrown-away take silently reappearing inside a good one, in the
+        dataset, with nothing to distinguish the frames afterwards. Draining
+        first makes it impossible: no item for the old episode can still be in
+        flight when `create_episode` moves the paths.
+
+        THE EPISODE ID IS ROLLED BACK so the next take reuses the slot and the
+        numbering stays contiguous. A discard is meant to leave no trace; a gap
+        at episode_0007 is a trace, and it invites the reader to hunt for a file
+        that was deliberately destroyed.
+
+        Deliberately NOT a fail-open: if there is no episode in progress this
+        returns False and does nothing, rather than deleting the previous
+        (already saved) episode -- which is what decrementing blindly would do.
+        """
+        if self.is_available:
+            logger_mp.warning("==> discard_episode: no episode in progress, nothing to discard.")
+            return False
+
+        self.item_data_queue.join()      # writes in flight must land BEFORE the rm
+        episode_dir = self.episode_dir
+        self.need_save = False
+        try:
+            shutil.rmtree(episode_dir)
+        except OSError as e:
+            # Report and still free the writer. A directory we cannot delete is a
+            # disk problem, not a reason to strand the operator in a state where
+            # no further episode can be created.
+            logger_mp.error(f"==> discard_episode: could not remove {episode_dir}: {e}")
+        self.episode_id = self.episode_id - 1
+        self.item_id = -1
+        self.first_item = True
+        self.is_available = True
+        logger_mp.info(f"==> Episode DISCARDED: {episode_dir} (next take reuses this id)")
+        return True
+    # -------------------------- END DIMENSO ADDITION --------------------------
 
     def close(self):
         """
