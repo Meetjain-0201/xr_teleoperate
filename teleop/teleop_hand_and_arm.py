@@ -279,6 +279,177 @@ def _dimenso_haptics_emit(session):
             logger_mp.error(f"[dimenso] haptics emit fault (logged once): {_e!r}")
 
 
+# ---- DIMENSO ADDITION (DIM-548): haptic confirmation for recording actions ----
+# The operator cannot see the terminal and, mid-task, is not looking at the wrist
+# overlay either -- their eyes are on the object. So a recording action that gives
+# no feedback is one the operator has to GUESS at, and guessing wrong means either
+# a take that was never recording or a good take thrown away.
+#
+# THE THREE MUST FEEL DIFFERENT, which is the whole design constraint. Strength
+# alone does not survive a gloved grip on a vibrating controller; DURATION does,
+# so it carries the distinction:
+#
+#   start   -- one short light tap    (40 ms)  "we are rolling"
+#   save    -- two firm taps          (2x60ms) "it is on disk"
+#   discard -- one long buzz          (200 ms) "that is gone"
+#
+# Two taps for save rather than one longer one: save is the most frequent action
+# and the one whose confirmation matters most, and a double tap is unmistakable
+# against both the single tap and the buzz.
+#
+# REUSES THE COLLISION PATH DELIBERATELY, rather than opening a second route to
+# the headset. Those shared Values are already the proven way from this process to
+# the Vuer child, already carry the props-vs-event correction (the props are a
+# silent no-op on vuer 0.1.6 -- see dimenso_haptics_client's header), and are
+# already covered by tests. A parallel mechanism would be a second thing to get
+# wrong.
+#
+# TWO HONEST LIMITS, both stated rather than designed around:
+#  1. This is gated on DIMENSO_HAPTICS=1 like everything else here. With haptics
+#     off there is no confirmation -- it degrades to today's behaviour, silently,
+#     which is the right failure for a feedback channel but is NOT a second
+#     independent confirmation of anything.
+#  2. The slots are latest-wins and the collision DDS thread writes them too. A
+#     collision landing in the same ~33 ms window can overwrite a confirmation
+#     before the child reads it. Rare, harmless (the operator feels the collision
+#     instead of the tap), and not worth a lock on the arm-pose handler's path.
+_DIMENSO_CONFIRM_PULSES = {
+    #                strength, ms,  repeats
+    "start":   (0.55,  40, 1),
+    "save":    (0.90,  60, 2),
+    "discard": (0.75, 200, 1),
+}
+_dimenso_confirm_faults = 0
+
+
+def _dimenso_confirm_haptic(kind):
+    """Buzz the controllers to confirm a recording action. Never raises.
+
+    Called from the main loop, not the DDS thread. Writes the shared slots the
+    Vuer child already polls; `_dimenso_haptics_emit` does the sending.
+    """
+    global _dimenso_confirm_faults
+    if not _dimenso_haptics_ready():
+        return False
+    spec = _DIMENSO_CONFIRM_PULSES.get(kind)
+    if spec is None:
+        return False
+    strength, ms, repeats = spec
+    try:
+        for _ in range(repeats):
+            for side in _DIMENSO_HAPTICS_SIDES:
+                slot = _DIMENSO_HAPTIC_STATE.get(side)
+                if slot is None:
+                    continue
+                # VALUES BEFORE THE COUNTER, matching _dimenso_haptics_ingest. The
+                # child gates on the counter, so bumping it first would let a tick
+                # read a fresh seq against a stale strength.
+                slot["strength"].value = float(strength)
+                slot["ms"].value = int(ms)
+                slot["seq"].value = slot["seq"].value + 1
+            if repeats > 1:
+                # A gap the wrist can actually resolve as two events. The child
+                # emits on its own ~30 Hz handler, so back-to-back seq bumps would
+                # collapse into one pulse -- the same preemption that makes a
+                # re-sent tap quieter rather than longer.
+                time.sleep(0.12)
+        return True
+    except Exception as _e:
+        _dimenso_confirm_faults += 1
+        if _dimenso_confirm_faults == 1:
+            logger_mp.error(f"[dimenso] confirm haptic fault (logged once): {_e!r}")
+        return False
+# ---------------------- END DIMENSO ADDITION ----------------------
+
+
+# ---- DIMENSO ADDITION (DIM-548): status readout INSIDE the headset ----
+# With the headset on there is no terminal, so "am I recording?" and "which
+# episode is this?" were unanswerable without taking it off. The record bindings
+# make a one-person session possible; without a readout that session is blind.
+#
+# BURNED INTO THE RENDERED FRAME rather than added as a Vuer text element. The
+# frame is already going to the headset every tick through `render_to_xr`, so an
+# overlay needs no new XR plumbing, no scene graph, and cannot get out of sync
+# with what the operator is looking at. It also degrades correctly: if the camera
+# is dead there is no frame, and a status line floating over a black void would be
+# claiming a liveness that does not exist.
+#
+# IT MUST NEVER REACH THE DATASET, and this is the sharp edge. `colors["color_0"]`
+# is assigned from `head_img.bgr` -- in the binocular branch as numpy SLICES, i.e.
+# views onto the very same buffer. Drawing in place would burn "REC ep 0003" into
+# every recorded frame and poison the training data with a label of its own state.
+# So this returns a COPY and the original is left untouched; the copy is handed to
+# render_to_xr and to nothing else.
+#
+# The copy costs ~1.8 MB/tick at 1280x480, ~55 MB/s at 30 Hz. Paid only when
+# there is something to draw.
+# cv2 is NOT imported at module scope in this file upstream, and py_compile does
+# not catch that -- it checks syntax, not names. Caught here only by running the
+# function; it is the same defect class as GOTCHAS 2026-09-10, where `os.getenv`
+# sat in a lifespan hook with no module-scope `import os` and shipped, because the
+# branch was behind a default-off flag.
+import cv2 as _dimenso_cv2
+
+_DIMENSO_OVERLAY_ENABLED = os.environ.get("DIMENSO_XR_OVERLAY", "1") == "1"
+
+
+def _dimenso_xr_overlay(bgr, *, started, recording, episode_id, frames, binocular):
+    """Return a COPY of `bgr` with a status strip drawn on it, or `bgr` unchanged.
+
+    NEVER mutates the input -- see the block above; the caller's array is recorded.
+    Never raises: a broken overlay must not cost the operator their video feed.
+    """
+    if not _DIMENSO_OVERLAY_ENABLED or bgr is None:
+        return bgr
+    try:
+        # RECORDING IS INVERTED -- white on a solid red plate, not red on black.
+        # Rendered and looked at (2026-09-10): red text on a black plate came out
+        # DIMMER than the green READY line, which is backwards. Recording is the
+        # state whose misreading costs the most -- believing you are rolling when
+        # you are not means performing a whole take for nothing -- so it gets the
+        # loudest treatment, and it matches how every camera signals record.
+        if recording:
+            text = f"REC  ep {episode_id:04d}  {frames}f"
+            colour = (255, 255, 255)        # BGR: white text...
+            plate = (0, 0, 200)             # ...on a solid red plate
+        elif started:
+            text = "READY  -  right B to record"
+            colour = (80, 220, 80)          # green
+            plate = (0, 0, 0)
+        else:
+            text = "IDLE  -  hold both A to engage"
+            colour = (200, 200, 200)        # grey
+            plate = (0, 0, 0)
+
+        out = bgr.copy()
+        h, w = out.shape[:2]
+        # In a side-by-side stereo frame the two halves are separate eyes, so a
+        # single top-left strip would be visible to one eye only -- which reads as
+        # a rendering fault rather than a status line.
+        panes = 2 if binocular else 1
+        pane_w = w // panes
+        scale = max(0.5, pane_w / 900.0)
+        thick = max(1, int(round(scale * 2)))
+        for p in range(panes):
+            x0 = p * pane_w + int(12 * scale)
+            y0 = int(30 * scale)
+            # A filled plate behind the text: white-on-white is unreadable, and the
+            # camera view behind this is whatever the robot happens to face.
+            (tw, th), base = _dimenso_cv2.getTextSize(text, _dimenso_cv2.FONT_HERSHEY_SIMPLEX, scale, thick)
+            _dimenso_cv2.rectangle(out, (x0 - int(6 * scale), y0 - th - int(8 * scale)),
+                          (x0 + tw + int(6 * scale), y0 + base + int(4 * scale)),
+                          plate, -1)
+            _dimenso_cv2.putText(out, text, (x0, y0), _dimenso_cv2.FONT_HERSHEY_SIMPLEX, scale,
+                        colour, thick, _dimenso_cv2.LINE_AA)
+        return out
+    except Exception:
+        # Deliberately silent and deliberately returning the ORIGINAL. This runs at
+        # 30 Hz on the display path; a per-tick log would bury the console, and a
+        # raise would cost the operator the feed they are steering by.
+        return bgr
+# ---------------------- END DIMENSO ADDITION ----------------------
+
+
 def _dimenso_patch_televuer_for_haptics():
     """Wrap TeleVuer.on_controller_move. MUST be called before TeleVuerWrapper(...).
 
@@ -836,7 +1007,19 @@ if __name__ == '__main__':
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img and head_img.bgr is not None:
-                    tv_wrapper.render_to_xr(head_img.bgr)
+                    # DIMENSO (DIM-548): status strip for the headset ONLY. The
+                    # overlay returns a COPY -- head_img.bgr must stay clean because
+                    # colors["color_0"] below is assigned from it (as numpy slices in
+                    # the binocular branch), and a "REC ep 0003" burned into every
+                    # recorded frame would poison the dataset.
+                    tv_wrapper.render_to_xr(_dimenso_xr_overlay(
+                        head_img.bgr,
+                        started=START,
+                        recording=RECORD_RUNNING,
+                        episode_id=getattr(recorder, "episode_id", -1) if args.record else -1,
+                        frames=(getattr(recorder, "item_id", -1) + 1) if args.record else 0,
+                        binocular=camera_config['head_camera']['binocular'],
+                    ))
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
@@ -850,11 +1033,17 @@ if __name__ == '__main__':
                 if not RECORD_RUNNING:
                     if recorder.create_episode():
                         RECORD_RUNNING = True
+                        # DIMENSO (DIM-548): confirm ONLY on success. A tap after a
+                        # failed create_episode would tell the operator they are
+                        # recording when they are not, which is worse than silence --
+                        # they would perform the whole task for nothing.
+                        _dimenso_confirm_haptic("start")
                     else:
                         logger_mp.error("Failed to create episode. Recording not started.")
                 else:
                     RECORD_RUNNING = False
                     recorder.save_episode()
+                    _dimenso_confirm_haptic("save")
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
 
@@ -872,7 +1061,8 @@ if __name__ == '__main__':
                 RECORD_DISCARD = False
                 if RECORD_RUNNING:
                     RECORD_RUNNING = False
-                    recorder.discard_episode()
+                    if recorder.discard_episode():
+                        _dimenso_confirm_haptic("discard")
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
                 else:
