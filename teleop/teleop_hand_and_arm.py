@@ -668,15 +668,20 @@ if __name__ == '__main__':
 
         # Both A buttons (left X + right A) held for ~0.4s engages. NOT the triggers
         # -- those already drive the Inspire hands, so a trigger gesture would clench
-        # them at the instant of engage. NOT the thumbstick clicks -- upstream uses
-        # both of those for Damp(). The hold requirement is so a brushed button
-        # cannot engage a robot.
+        # them at the instant of engage. NOT the thumbstick clicks -- both of those
+        # are taken by the double-thumbstick stop combo (which called Damp() upstream
+        # and calls StopMove() here since DIM-548). The hold requirement is so a
+        # brushed button cannot engage a robot.
         _DIMENSO_ENGAGE_TICKS = 12          # x 0.033s ~= 0.4s
         # DIM-657: the walking-mode quit (right A) must not fire on the button
         # press that ENGAGED. False until right A is observed released. See the
         # block at the quit check for the measurement.
         _dimenso_quit_armed = False
         _dimenso_engage_held = 0
+        # DIM-548: edge-trigger for the double-thumbstick stop. True while the combo
+        # is held so the StopMove RPC fires once per press instead of every tick at
+        # ~90 Hz. See the block at the stop check.
+        _dimenso_stick_stop_latched = False
 
         # ---- DIMENSO ADDITION: arms home on scene reset ----
         # A whole-scene reset restores the robot and the objects, but the ARMS are
@@ -945,13 +950,57 @@ if __name__ == '__main__':
                     START = False
                     STOP = True
                 # ---------------------- END DIMENSO ADDITION ----------------------
-                # command robot to enter damping mode. soft emergency stop function
+                # ---- DIMENSO ADDITION (DIM-548): BOTH THUMBSTICKS STOP, THEY DO NOT DAMP ----
+                # Upstream bound this combo to `loco_wrapper.Damp()` and called it a
+                # "soft emergency stop". On a standing humanoid Damp is ZERO TORQUE --
+                # the legs stop holding the robot up and it goes down. That is not a
+                # soft stop, it is a controlled collapse, and on a gantry it is a fall.
+                #
+                # WHY THIS BINDING IS PARTICULARLY WRONG HERE: the thumbsticks ARE the
+                # walking controls (the Move call below reads the very same axes), so
+                # while walking the operator's thumbs are resting on both of them
+                # continuously. The only thing between a walk and a collapse was not
+                # pressing down. An e-stop you can trigger by gripping harder is a
+                # hazard, not a safety feature.
+                #
+                # It now calls StopMove(): velocity to zero, balance controller left
+                # RUNNING, robot stays on its feet. That is the stop an operator
+                # actually wants mid-walk, and it is what the physical remote does.
+                #
+                # DAMP IS NOT REMOVED FROM THE SYSTEM, it is unbound from the
+                # controller. `LocoClientWrapper.Damp()` still exists and the physical
+                # L1+A remote stop is unchanged and remains the real e-stop
+                # (HOW-MEET-WORKS 1.5: a convenience layer never replaces it). If the
+                # robot genuinely needs to go limp, L1+A is in the operator's hand.
+                #
+                # EDGE-TRIGGERED, not level-triggered: this loop runs at ~90 Hz and a
+                # level trigger would fire the RPC every tick for as long as the combo
+                # is held. Latched on press, cleared on release.
+                #
+                # AND THE MOVE CALL IS NOW SKIPPED WHILE THE COMBO IS HELD. Upstream
+                # called Damp() and then IMMEDIATELY Move(sticks) on the same tick, so
+                # the stop was overridden by a fresh velocity command microseconds
+                # later. That is a real defect independent of Damp-vs-StopMove: a stop
+                # followed by a move in the same pass is not a stop. Clicking a stick
+                # tends to push its axes toward zero, which is probably why it went
+                # unnoticed -- "probably" because it was never measured, and it is not
+                # guaranteed for a thumb that clicks off-centre.
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
-                    loco_wrapper.Damp()
-                # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
-                loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
-                                  -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
-                                  -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
+                    if not _dimenso_stick_stop_latched:
+                        _dimenso_stick_stop_latched = True
+                        logger_mp.warning(
+                            "[dimenso] both thumbsticks -- StopMove() (velocity zeroed, "
+                            "still balancing). This is NOT a damp. For a real emergency "
+                            "stop use L1+A on the remote."
+                        )
+                        loco_wrapper.StopMove()
+                else:
+                    _dimenso_stick_stop_latched = False
+                    # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
+                    loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
+                                      -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
+                                      -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
+                # -------------------- END DIMENSO ADDITION --------------------
 
             # get current robot state data.
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()

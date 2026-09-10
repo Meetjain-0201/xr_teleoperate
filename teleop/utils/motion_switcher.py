@@ -47,6 +47,22 @@ class LocoClientWrapper:
         # 2026-07-21, ahead of first walking-mode use.
         self.client.Damp()
 
+    # ---------------------------- DIMENSO ADDITION ----------------------------
+    def StopMove(self):
+        """Stop walking and KEEP BALANCING. This is what the double-thumbstick
+        combo calls now; `Damp()` above is no longer bound to any controller
+        input. See teleop_hand_and_arm.py's double-thumbstick block for why.
+
+        `StopMove()` zeroes the commanded velocity and leaves the balance
+        controller running, so the robot stays upright on its own feet. In FSM
+        501 with balance mode 0 the FSM starts and stops the gait itself, which
+        is why zeroing velocity is sufficient to end a walk -- measured on
+        Hercules 2026-09-02, and the reason balance mode 1 was abandoned there
+        (continuous gait marches in place forever and StopMove cannot end it).
+        """
+        self.client.StopMove()
+    # -------------------------- END DIMENSO ADDITION --------------------------
+
     def Move(self, vx, vy, vyaw):
         self.client.Move(vx, vy, vyaw, continous_move=False)
 
