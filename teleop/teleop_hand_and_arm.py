@@ -8,6 +8,8 @@ logger_mp = logging_mp.getLogger(__name__)
 
 import os 
 import sys
+import json as _dimenso_json
+from urllib.request import urlopen as _dimenso_urlopen
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
@@ -19,6 +21,8 @@ from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_Arm
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
+from teleop.utils.dimenso_episode_buttons import EpisodeButtons
+from teleop.utils.dimenso_arm_hold import ArmHold
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
 
@@ -72,12 +76,31 @@ def on_press(key):
 def get_state() -> dict:
     """Return current heartbeat state"""
     global START, STOP, RECORD_RUNNING, READY
+    buttons = _DIMENSO_EPISODE_BUTTONS
     return {
         "START": START,
         "STOP": STOP,
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
+        "EPISODE_EVENTS": buttons.snapshot() if buttons is not None else [],
+        "FOLLOW_PAUSED": buttons.paused if buttons is not None else False,
     }
+
+
+_DIMENSO_EPISODE_BUTTONS = None
+_DIMENSO_RECORDING_STATUS = None
+
+
+def _dimenso_poll_recording_status(url):
+    """Read the website recorder in a daemon thread; never delay arm control."""
+    global _DIMENSO_RECORDING_STATUS
+    while not STOP:
+        try:
+            with _dimenso_urlopen(url, timeout=0.4) as response:
+                _DIMENSO_RECORDING_STATUS = _dimenso_json.load(response)
+        except Exception as exc:
+            _DIMENSO_RECORDING_STATUS = {"phase": "unknown", "warning": f"Recorder status unavailable: {exc}"}
+        time.sleep(0.5)
 
 # DIMENSO ADDITION: shared between the rt/reset_pose/cmd callback thread and the
 # main loop. Module level because the loop is module-level code, so a closure
@@ -393,7 +416,7 @@ import cv2 as _dimenso_cv2
 _DIMENSO_OVERLAY_ENABLED = os.environ.get("DIMENSO_XR_OVERLAY", "1") == "1"
 
 
-def _dimenso_xr_overlay(bgr, *, started, recording, episode_id, frames, binocular):
+def _dimenso_xr_overlay(bgr, *, started, recording, episode_id, frames, binocular, status=None):
     """Return a COPY of `bgr` with a status strip drawn on it, or `bgr` unchanged.
 
     NEVER mutates the input -- see the block above; the caller's array is recorded.
@@ -408,7 +431,35 @@ def _dimenso_xr_overlay(bgr, *, started, recording, episode_id, frames, binocula
         # state whose misreading costs the most -- believing you are rolling when
         # you are not means performing a whole take for nothing -- so it gets the
         # loudest treatment, and it matches how every camera signals record.
-        if recording:
+        if status is not None:
+            phase = status.get("phase")
+            control = status.get("questControl") or {}
+            error = control.get("error") or status.get("warning")
+            if error:
+                text = f"RECORDER ERROR: {str(error)[:55]}"
+                colour, plate = (255, 255, 255), (0, 0, 200)
+            elif phase == "recording":
+                text = f"REC ep {int(status.get('currentIndex') or 0) + 1} / {status.get('targetEpisodes')}  B save  Y discard"
+                colour, plate = (255, 255, 255), (0, 0, 200)
+            elif phase == "awaiting_reset":
+                text = f"SAVED {status.get('savedCount')} / {status.get('targetEpisodes')}  reset scene, hold X+A"
+                colour, plate = (80, 220, 80), (0, 0, 0)
+            elif phase == "complete":
+                text = f"DONE {status.get('savedCount')} / {status.get('targetEpisodes')}  hold B to upload"
+                colour, plate = (80, 220, 80), (0, 0, 0)
+            elif phase == "idle" and control.get("lastApplied") == "end":
+                text = "SESSION UPLOADED"
+                colour, plate = (80, 220, 80), (0, 0, 0)
+            elif phase == "idle" and started:
+                text = "READY  B start recording"
+                colour, plate = (80, 220, 80), (0, 0, 0)
+            elif phase == "idle":
+                text = "HOLD X+A TO ENGAGE"
+                colour, plate = (200, 200, 200), (0, 0, 0)
+            else:
+                text = "RECORDER STATUS UNKNOWN"
+                colour, plate = (255, 255, 255), (0, 0, 200)
+        elif recording:
             text = f"REC  ep {episode_id:04d}  {frames}f"
             colour = (255, 255, 255)        # BGR: white text...
             plate = (0, 0, 200)             # ...on a solid red plate
@@ -883,6 +934,16 @@ if __name__ == '__main__':
         _dimenso_save_was_down = False
         _dimenso_discard_held = 0
         _DIMENSO_DISCARD_TICKS = _DIMENSO_ENGAGE_TICKS   # ~0.4 s, same feel as engage
+        if args.ipc and not args.sim and args.input_mode == "controller":
+            _DIMENSO_EPISODE_BUTTONS = EpisodeButtons(hold_ticks=_DIMENSO_DISCARD_TICKS)
+            _DIMENSO_RECORDING_STATUS = {"phase": "unknown", "warning": "Waiting for recorder status"}
+            _dimenso_status_url = os.environ.get("DIMENSO_RECORDING_STATUS_URL")
+            if _dimenso_status_url:
+                threading.Thread(target=_dimenso_poll_recording_status, args=(_dimenso_status_url,), daemon=True).start()
+        _dimenso_paused_stop_sent = False
+        _dimenso_last_recording_phase = None
+        _dimenso_resume_waiting = False
+        _dimenso_arm_hold = ArmHold()
 
         # ---- DIMENSO ADDITION: arms home on scene reset ----
         # A whole-scene reset restores the robot and the objects, but the ARMS are
@@ -983,7 +1044,12 @@ if __name__ == '__main__':
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
-                    tv_wrapper.render_to_xr(head_img.bgr)
+                    tv_wrapper.render_to_xr(_dimenso_xr_overlay(
+                        head_img.bgr, started=False, recording=False,
+                        episode_id=-1, frames=0,
+                        binocular=camera_config['head_camera']['binocular'],
+                        status=_DIMENSO_RECORDING_STATUS if _DIMENSO_EPISODE_BUTTONS is not None else None,
+                    ))
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
@@ -1019,6 +1085,7 @@ if __name__ == '__main__':
                         episode_id=getattr(recorder, "episode_id", -1) if args.record else -1,
                         frames=(getattr(recorder, "item_id", -1) + 1) if args.record else 0,
                         binocular=camera_config['head_camera']['binocular'],
+                        status=_DIMENSO_RECORDING_STATUS if _DIMENSO_EPISODE_BUTTONS is not None else None,
                     ))
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
@@ -1071,6 +1138,35 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+            if _DIMENSO_EPISODE_BUTTONS is not None and isinstance(_DIMENSO_RECORDING_STATUS, dict):
+                _phase = _DIMENSO_RECORDING_STATUS.get("phase")
+                if _phase != _dimenso_last_recording_phase and _phase in ("awaiting_reset", "complete"):
+                    _DIMENSO_EPISODE_BUTTONS.paused = True
+                if _dimenso_resume_waiting and _phase == "recording":
+                    _DIMENSO_EPISODE_BUTTONS.paused = False
+                    _dimenso_resume_waiting = False
+                _dimenso_last_recording_phase = _phase
+
+            # The website owns episode persistence. Real Quest buttons publish
+            # numbered intents in the existing IPC heartbeat, even without
+            # --record; the backend applies them to the same recorder as the UI.
+            if _DIMENSO_EPISODE_BUTTONS is not None:
+                _fired = _DIMENSO_EPISODE_BUTTONS.sample(
+                    x=tele_data.left_ctrl_aButton,
+                    a=tele_data.right_ctrl_aButton,
+                    y=tele_data.left_ctrl_bButton,
+                    b=tele_data.right_ctrl_bButton,
+                    recording=_dimenso_last_recording_phase == "recording",
+                )
+                for _event in _fired:
+                    logger_mp.info("[dimenso] Quest episode button: %s", _event)
+                if "resume" in _fired and _dimenso_last_recording_phase == "awaiting_reset":
+                    _DIMENSO_EPISODE_BUTTONS.paused = True
+                    _dimenso_resume_waiting = True
+                if _DIMENSO_EPISODE_BUTTONS.paused:
+                    _dimenso_arm_hold.capture(arm_ctrl)
+                else:
+                    _dimenso_arm_hold.release()
 
             # ---- DIMENSO ADDITION (DIM-548): RECORDING FROM THE CONTROLLER ----
             # THE POINT: an operator in a headset cannot reach a keyboard. Before
@@ -1133,7 +1229,9 @@ if __name__ == '__main__':
                     _dimenso_discard_held = 0
             # ---------------------- END DIMENSO ADDITION ----------------------
 
-            if args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
+            if _DIMENSO_EPISODE_BUTTONS is not None and _DIMENSO_EPISODE_BUTTONS.paused:
+                pass  # Keep the last hand target; resetting the scene must not move fingers.
+            elif args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
@@ -1248,7 +1346,7 @@ if __name__ == '__main__':
                 if not _dimenso_quit_armed:
                     if _dimenso_a_neutral:
                         _dimenso_quit_armed = True
-                elif _dimenso_quit_pressed:
+                elif _dimenso_quit_pressed and _DIMENSO_EPISODE_BUTTONS is None:
                     logger_mp.info("[dimenso] right A alone -- quitting")
                     START = False
                     STOP = True
@@ -1288,7 +1386,13 @@ if __name__ == '__main__':
                 # tends to push its axes toward zero, which is probably why it went
                 # unnoticed -- "probably" because it was never measured, and it is not
                 # guaranteed for a thumb that clicks off-centre.
-                if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
+                if _DIMENSO_EPISODE_BUTTONS is not None and _DIMENSO_EPISODE_BUTTONS.paused:
+                    if not _dimenso_paused_stop_sent:
+                        loco_wrapper.StopMove()
+                        _dimenso_paused_stop_sent = True
+                    # No Move RPC while following is paused, including off-centre sticks.
+                elif tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
+                    _dimenso_paused_stop_sent = False
                     if not _dimenso_stick_stop_latched:
                         _dimenso_stick_stop_latched = True
                         logger_mp.warning(
@@ -1298,6 +1402,7 @@ if __name__ == '__main__':
                         )
                         loco_wrapper.StopMove()
                 else:
+                    _dimenso_paused_stop_sent = False
                     _dimenso_stick_stop_latched = False
                     # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
                     loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
@@ -1318,7 +1423,11 @@ if __name__ == '__main__':
             # Inside the window opened by a whole-scene reset, command ZERO instead of
             # the IK solution. Same target as ctrl_dual_arm_go_home(), but applied
             # through the loop that already owns q_target, so nothing fights it.
-            if _DIMENSO_RESET_FLAG and time.time() < _DIMENSO_RESET_FLAG:
+            if _DIMENSO_EPISODE_BUTTONS is not None and _DIMENSO_EPISODE_BUTTONS.paused:
+                # Keep the last commanded pose and gravity support. Tracking the
+                # measured pose with zero feedforward lets the arm sag each tick.
+                arm_ctrl.ctrl_dual_arm(*_dimenso_arm_hold.command())
+            elif _DIMENSO_RESET_FLAG and time.time() < _DIMENSO_RESET_FLAG:
                 arm_ctrl.ctrl_dual_arm(_dimenso_np.zeros(14), _dimenso_np.zeros(14))
             else:
                 if _DIMENSO_RESET_FLAG:
