@@ -19,5 +19,8 @@ def test_every_declared_capability_is_implemented_here():
 
 
 def test_every_dimenso_module_is_declared():
-    modules = {str(p.relative_to(ROOT)) for p in (ROOT / "teleop" / "utils").glob("dimenso_*.py")}
+    # Every Dimenso module this repo owns under teleop/, at any depth (submodules excluded: not ours).
+    owned = [p for p in (ROOT / "teleop").rglob("dimenso_*.py")
+             if not {"televuer", "teleimager", "dex-retargeting"} & set(p.relative_to(ROOT).parts)]
+    modules = {str(p.relative_to(ROOT)) for p in owned}
     assert modules == set(DECLARATION["implementedBy"].values())
