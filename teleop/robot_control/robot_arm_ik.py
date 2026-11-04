@@ -15,6 +15,16 @@ sys.path.append(parent2_dir)
 
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
+
+def gravity_torque_for(arm_ik, q):
+    """Support a held arm target with the same reduced model used by solve_ik."""
+    reduced = arm_ik.reduced_robot
+    model = reduced.model
+    q = np.asarray(q)
+    if q.shape != (model.nq,):
+        raise ValueError(f"arm target has shape {q.shape}, expected {(model.nq,)}")
+    return pin.rnea(model, reduced.data, q, np.zeros(model.nv), np.zeros(model.nv))
+
 class G1_29_ArmIK:
     def __init__(self, Unit_Test = False, Visualization = False):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
