@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "component": "quest_client",
+  "capabilities": [
+    "episode_buttons",
+    "arm_hold",
+    "hand_reset",
+    "collision_haptics"
+  ],
+  "implementedBy": {
+    "episode_buttons": "teleop/utils/dimenso_episode_buttons.py",
+    "arm_hold": "teleop/utils/dimenso_arm_hold.py",
+    "hand_reset": "teleop/utils/dimenso_hand_reset.py",
+    "collision_haptics": "teleop/dimenso_haptics_client.py"
+  }
+}
