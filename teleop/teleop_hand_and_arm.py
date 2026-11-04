@@ -22,6 +22,7 @@ from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.dimenso_episode_buttons import EpisodeButtons
+from teleop.utils.dimenso_hand_reset import release_brainco_at_home
 from teleop.utils.dimenso_arm_hold import ArmHold
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
@@ -1250,8 +1251,26 @@ if __name__ == '__main__':
                     _dimenso_discard_held = 0
             # ---------------------- END DIMENSO ADDITION ----------------------
 
-            if _DIMENSO_EPISODE_BUTTONS is not None and _DIMENSO_EPISODE_BUTTONS.paused:
-                pass  # Keep the last hand target; resetting the scene must not move fingers.
+            if (_DIMENSO_EPISODE_BUTTONS is not None and
+                    release_brainco_at_home(
+                        phase=_dimenso_last_recording_phase,
+                        home_ready=_dimenso_arm_hold.home_ready,
+                        end_effector=args.ee,
+                        input_mode=args.input_mode)):
+                # A saved or discarded take holds its grasp until the arms reach
+                # home. Open there so the operator can reset the object without
+                # removing the headset. Quest triggers cannot re-close the hand
+                # until X+A starts the next take.
+                with left_gripper_trigger_in.get_lock():
+                    left_gripper_trigger_in.value = 10.0
+                with left_gripper_squeeze_in.get_lock():
+                    left_gripper_squeeze_in.value = 0.0
+                with right_gripper_trigger_in.get_lock():
+                    right_gripper_trigger_in.value = 10.0
+                with right_gripper_squeeze_in.get_lock():
+                    right_gripper_squeeze_in.value = 0.0
+            elif _DIMENSO_EPISODE_BUTTONS is not None and _DIMENSO_EPISODE_BUTTONS.paused:
+                pass  # Hold fingers during a mid-take A pause or the arm home ramp.
             elif args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
