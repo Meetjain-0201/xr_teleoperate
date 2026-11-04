@@ -33,14 +33,14 @@ class EpisodeButtons:
         with self._events_lock:
             return list(self.events)
 
-    def sample(self, *, x, a, y, b, recording=False):
+    def sample(self, *, x, a, y, b, recording=False, can_resume=True, can_end=True):
         """Return intents fired this tick; a single press cannot fire twice."""
         before = self._seq
         if not x and not a:
             self._a_neutral = True
 
         if self.paused:
-            self._resume_ticks = self._resume_ticks + 1 if x and a else 0
+            self._resume_ticks = self._resume_ticks + 1 if x and a and can_resume else 0
             if self._resume_ticks == self.hold_ticks:
                 self.paused = False
                 self._a_neutral = False
@@ -53,7 +53,7 @@ class EpisodeButtons:
 
         if b:
             self._b_ticks += 1
-            if self._b_ticks == self.hold_ticks * 5:
+            if self._b_ticks == self.hold_ticks * 5 and can_end:
                 self._emit("end")
         elif self._b_ticks:
             if self._b_ticks < self.hold_ticks * 5 and not self.paused:

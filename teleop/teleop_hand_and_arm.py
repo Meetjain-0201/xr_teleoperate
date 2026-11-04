@@ -17,7 +17,7 @@ sys.path.append(parent_dir)
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
 from teleop.robot_control.robot_arm import G1_29_ArmController, G1_23_ArmController, H1_2_ArmController, H1_ArmController, H2_ArmController
-from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK
+from teleop.robot_control.robot_arm_ik import G1_29_ArmIK, G1_23_ArmIK, H1_2_ArmIK, H1_ArmIK, H2_ArmIK, gravity_torque_for
 from teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.ipc import IPC_Server
@@ -434,18 +434,24 @@ def _dimenso_xr_overlay(bgr, *, started, recording, episode_id, frames, binocula
         if status is not None:
             phase = status.get("phase")
             control = status.get("questControl") or {}
-            error = control.get("error") or status.get("warning")
+            error = control.get("error")
             if error:
                 text = f"RECORDER ERROR: {str(error)[:55]}"
+                colour, plate = (255, 255, 255), (0, 0, 200)
+            elif phase in ("awaiting_reset", "complete") and not status.get("armHomeReady"):
+                text = "ARMS RETURNING HOME  wait before X+A or end"
+                colour, plate = (255, 255, 255), (0, 0, 200)
+            elif phase == "recording" and status.get("followPaused"):
+                text = "REC CONTINUES  arms paused  X+A resume"
                 colour, plate = (255, 255, 255), (0, 0, 200)
             elif phase == "recording":
                 text = f"REC ep {int(status.get('currentIndex') or 0) + 1} / {status.get('targetEpisodes')}  B save  Y discard"
                 colour, plate = (255, 255, 255), (0, 0, 200)
             elif phase == "awaiting_reset":
-                text = f"SAVED {status.get('savedCount')} / {status.get('targetEpisodes')}  reset scene, hold X+A"
+                text = f"HOME READY  SAVED {status.get('savedCount')} / {status.get('targetEpisodes')}  reset, hold X+A"
                 colour, plate = (80, 220, 80), (0, 0, 0)
             elif phase == "complete":
-                text = f"DONE {status.get('savedCount')} / {status.get('targetEpisodes')}  hold B to upload"
+                text = f"HOME READY  DONE {status.get('savedCount')} / {status.get('targetEpisodes')}  hold B to upload"
                 colour, plate = (80, 220, 80), (0, 0, 0)
             elif phase == "idle" and control.get("lastApplied") == "end":
                 text = "SESSION UPLOADED"
@@ -1048,7 +1054,11 @@ if __name__ == '__main__':
                         head_img.bgr, started=False, recording=False,
                         episode_id=-1, frames=0,
                         binocular=camera_config['head_camera']['binocular'],
-                        status=_DIMENSO_RECORDING_STATUS if _DIMENSO_EPISODE_BUTTONS is not None else None,
+                        status={**_DIMENSO_RECORDING_STATUS,
+                                "armHomeReady": _dimenso_arm_hold.home_ready,
+                                "followPaused": _DIMENSO_EPISODE_BUTTONS.paused}
+                        if _DIMENSO_EPISODE_BUTTONS is not None and isinstance(_DIMENSO_RECORDING_STATUS, dict)
+                        else None,
                     ))
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
@@ -1085,7 +1095,11 @@ if __name__ == '__main__':
                         episode_id=getattr(recorder, "episode_id", -1) if args.record else -1,
                         frames=(getattr(recorder, "item_id", -1) + 1) if args.record else 0,
                         binocular=camera_config['head_camera']['binocular'],
-                        status=_DIMENSO_RECORDING_STATUS if _DIMENSO_EPISODE_BUTTONS is not None else None,
+                        status={**_DIMENSO_RECORDING_STATUS,
+                                "armHomeReady": _dimenso_arm_hold.home_ready,
+                                "followPaused": _DIMENSO_EPISODE_BUTTONS.paused}
+                        if _DIMENSO_EPISODE_BUTTONS is not None and isinstance(_DIMENSO_RECORDING_STATUS, dict)
+                        else None,
                     ))
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
@@ -1142,6 +1156,8 @@ if __name__ == '__main__':
                 _phase = _DIMENSO_RECORDING_STATUS.get("phase")
                 if _phase != _dimenso_last_recording_phase and _phase in ("awaiting_reset", "complete"):
                     _DIMENSO_EPISODE_BUTTONS.paused = True
+                    _dimenso_arm_hold.capture(arm_ctrl)
+                    _dimenso_arm_hold.begin_home()
                 if _dimenso_resume_waiting and _phase == "recording":
                     _DIMENSO_EPISODE_BUTTONS.paused = False
                     _dimenso_resume_waiting = False
@@ -1157,6 +1173,11 @@ if __name__ == '__main__':
                     y=tele_data.left_ctrl_bButton,
                     b=tele_data.right_ctrl_bButton,
                     recording=_dimenso_last_recording_phase == "recording",
+                    can_resume=(_dimenso_last_recording_phase == "recording" or
+                                (_dimenso_last_recording_phase == "awaiting_reset" and
+                                 _dimenso_arm_hold.home_ready)),
+                    can_end=(_dimenso_last_recording_phase == "complete" and
+                             _dimenso_arm_hold.home_ready),
                 )
                 for _event in _fired:
                     logger_mp.info("[dimenso] Quest episode button: %s", _event)
@@ -1424,9 +1445,16 @@ if __name__ == '__main__':
             # the IK solution. Same target as ctrl_dual_arm_go_home(), but applied
             # through the loop that already owns q_target, so nothing fights it.
             if _DIMENSO_EPISODE_BUTTONS is not None and _DIMENSO_EPISODE_BUTTONS.paused:
-                # Keep the last commanded pose and gravity support. Tracking the
-                # measured pose with zero feedforward lets the arm sag each tick.
-                arm_ctrl.ctrl_dual_arm(*_dimenso_arm_hold.command())
+                if _dimenso_arm_hold.returning_home:
+                    arm_ctrl.ctrl_dual_arm(*_dimenso_arm_hold.home_command(
+                        current_lr_arm_q,
+                        lambda q: gravity_torque_for(arm_ik, q),
+                        dt=1.0 / args.frequency,
+                    ))
+                else:
+                    # B/Y hold immediately; travel home only after save/discard
+                    # is accepted and the recorder enters the reset window.
+                    arm_ctrl.ctrl_dual_arm(*_dimenso_arm_hold.command())
             elif _DIMENSO_RESET_FLAG and time.time() < _DIMENSO_RESET_FLAG:
                 arm_ctrl.ctrl_dual_arm(_dimenso_np.zeros(14), _dimenso_np.zeros(14))
             else:

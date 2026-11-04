@@ -55,3 +55,24 @@ def test_b_save_pauses_following_immediately_but_b_start_does_not():
     buttons.sample(x=False, a=False, y=False, b=True, recording=True)
     assert buttons.sample(x=False, a=False, y=False, b=False, recording=True) == ["toggle"]
     assert buttons.paused is True
+
+
+def test_x_plus_a_cannot_resume_until_arms_are_home():
+    buttons = EpisodeButtons(hold_ticks=3)
+    buttons.paused = True
+    for _ in range(5):
+        assert buttons.sample(x=True, a=True, y=False, b=False, can_resume=False) == []
+    assert buttons.paused is True
+    for _ in range(3):
+        events = buttons.sample(x=True, a=True, y=False, b=False, can_resume=True)
+    assert events == ["resume"]
+
+
+def test_long_b_only_ends_after_final_home_is_ready():
+    buttons = EpisodeButtons(hold_ticks=3)
+    for _ in range(15):
+        assert buttons.sample(x=False, a=False, y=False, b=True, can_end=False) == []
+    assert buttons.sample(x=False, a=False, y=False, b=False, can_end=False) == []
+    for _ in range(14):
+        buttons.sample(x=False, a=False, y=False, b=True, can_end=True)
+    assert buttons.sample(x=False, a=False, y=False, b=True, can_end=True) == ["end"]
