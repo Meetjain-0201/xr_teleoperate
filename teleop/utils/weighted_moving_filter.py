@@ -1,5 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
 
 
 class WeightedMovingFilter:
@@ -10,6 +9,11 @@ class WeightedMovingFilter:
         self._data_size = data_size
         self._filtered_data = np.zeros(self._data_size)
         self._data_queue = []
+
+    def reset(self, measured):
+        """Discard old solutions when a new follow reference is captured."""
+        self._data_queue = []
+        self._filtered_data = np.asarray(measured, dtype=float).copy()
 
     def _apply_filter(self):
         if len(self._data_queue) < self._window_size:
@@ -40,6 +44,7 @@ class WeightedMovingFilter:
 
 
 def visualize_filter_comparison(filter_params, steps):
+    import matplotlib.pyplot as plt
     import time
     t = np.linspace(0, 4 * np.pi, steps)
     original_data = np.array([np.sin(t + i) + np.random.normal(0, 0.2, len(t)) for i in range(35)]).T  # sin wave with noise, shape is [len(t), 35]

@@ -24,6 +24,11 @@ from teleop.utils.ipc import IPC_Server
 from teleop.utils.dimenso_episode_buttons import EpisodeButtons
 from teleop.utils.dimenso_hand_reset import release_brainco_at_home
 from teleop.utils.dimenso_arm_hold import ArmHold
+from teleop.utils.dimenso_follow_anchor import FollowAnchor, controller_command, tracking_ready
+from teleop.utils.dimenso_shutdown import Shutdown
+_DIMENSO_SHUTDOWN = Shutdown()
+_DIMENSO_ARM_CONTROLLER = None
+_DIMENSO_ARM_INPUT_ERROR = None
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
 
@@ -60,7 +65,17 @@ RECORD_DISCARD = False
 
 def on_press(key):
     global STOP, START, RECORD_TOGGLE, RECORD_DISCARD
-    if key == 'r':
+    if _DIMENSO_SHUTDOWN.requested and key not in ("graceful_disconnect", "shutdown_ack"):
+        raise RuntimeError("Shutdown is in progress; controller commands are locked")
+    if key == 'graceful_disconnect':
+        if not _DIMENSO_SHUTDOWN.supported:
+            raise RuntimeError('graceful disconnect unsupported for this controller/mode')
+        _DIMENSO_SHUTDOWN.request()
+        START = False
+        STOP = True
+    elif key == 'shutdown_ack':
+        _DIMENSO_SHUTDOWN.ack()
+    elif key == 'r':
         START = True
     elif key == 'q':
         START = False
@@ -91,6 +106,8 @@ def get_state() -> dict:
         "EPISODE_EVENTS": buttons.snapshot() if buttons is not None else [],
         "FOLLOW_PAUSED": buttons.paused if buttons is not None else False,
         "INPUT_DIAGNOSTICS": _DIMENSO_INPUT_DIAGNOSTICS.snapshot(),
+        "ARM_COMMAND_ERROR": getattr(_DIMENSO_ARM_CONTROLLER, "command_error", None) or _DIMENSO_ARM_INPUT_ERROR,
+        **_DIMENSO_SHUTDOWN.snapshot(),
     }
 
 
@@ -1034,6 +1051,9 @@ if __name__ == '__main__':
                 )
         # -------------- END DIMENSO ADDITION --------------
 
+        _DIMENSO_ARM_CONTROLLER = arm_ctrl
+        _DIMENSO_SHUTDOWN.supported = (args.arm == "G1_29" and args.motion and not args.sim)
+        _dimenso_follow_anchor = FollowAnchor()
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
@@ -1046,7 +1066,7 @@ if __name__ == '__main__':
                     _d = tv_wrapper.get_tele_data()
                     if _d.left_ctrl_aButton and _d.right_ctrl_aButton:
                         _dimenso_engage_held += 1
-                        if _dimenso_engage_held >= _DIMENSO_ENGAGE_TICKS:
+                        if _dimenso_engage_held >= _DIMENSO_ENGAGE_TICKS and tracking_ready(_d):
                             logger_mp.info("[dimenso] both A buttons held -- engaging")
                             START = True
                     else:
@@ -1180,7 +1200,7 @@ if __name__ == '__main__':
                     y=tele_data.left_ctrl_bButton,
                     b=tele_data.right_ctrl_bButton,
                     recording=_dimenso_last_recording_phase == "recording",
-                    can_resume=(_dimenso_last_recording_phase == "recording" or
+                    can_resume=(_dimenso_last_recording_phase in ("idle", "recording") or
                                 (_dimenso_last_recording_phase == "awaiting_reset" and
                                  _dimenso_arm_hold.home_ready)),
                     can_end=(_dimenso_last_recording_phase == "complete" and
@@ -1195,6 +1215,15 @@ if __name__ == '__main__':
                     _dimenso_arm_hold.capture(arm_ctrl)
                 else:
                     _dimenso_arm_hold.release()
+
+            # Tracking loss requires an explicit re-engage, never an automatic jump.
+            if args.input_mode == "controller" and not tracking_ready(tele_data, require_head=not _dimenso_follow_anchor.active):
+                if _DIMENSO_EPISODE_BUTTONS is not None:
+                    _DIMENSO_EPISODE_BUTTONS.paused = True
+                    _dimenso_arm_hold.capture(arm_ctrl)
+                else:
+                    START = False
+                _dimenso_follow_anchor.clear()
 
             # ---- DIMENSO ADDITION (DIM-548): RECORDING FROM THE CONTROLLER ----
             # THE POINT: an operator in a headset cannot reach a keyboard. Before
@@ -1480,13 +1509,44 @@ if __name__ == '__main__':
                                       -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
                 # -------------------- END DIMENSO ADDITION --------------------
 
+            if STOP:
+                break
             # get current robot state data.
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
             current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
+            if args.arm == "G1_29" and not args.sim:
+                from teleop.utils.dimenso_graceful_home import _checked
+                try:
+                    if getattr(arm_ctrl, "command_error", None):
+                        raise ValueError(arm_ctrl.command_error)
+                    current_lr_arm_q = _checked(
+                        arm_ctrl.get_current_dual_arm_recovery_snapshot(), time.monotonic())
+                    _DIMENSO_ARM_INPUT_ERROR = None
+                except (ValueError, TypeError) as exc:
+                    _DIMENSO_ARM_INPUT_ERROR = str(exc)
+                    if _DIMENSO_EPISODE_BUTTONS is not None:
+                        _DIMENSO_EPISODE_BUTTONS.paused = True
+                    START = False
+                    _dimenso_follow_anchor.clear()
+                    time.sleep(1.0 / args.frequency)
+                    continue
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
-            sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+            _paused = (_DIMENSO_EPISODE_BUTTONS is not None and _DIMENSO_EPISODE_BUTTONS.paused)
+            _home = bool(_DIMENSO_RESET_FLAG and time.time() < _DIMENSO_RESET_FLAG)
+            _follow = START and not _paused and not _home
+            if args.input_mode == "controller":
+                _follow = _follow and tracking_ready(tele_data, require_head=not _dimenso_follow_anchor.active)
+            if args.input_mode == "controller":
+                sol_q, sol_tauff = controller_command(
+                    _dimenso_follow_anchor, arm_ik, tele_data, current_lr_arm_q, current_lr_arm_dq,
+                    following=_follow, gravity=gravity_torque_for)
+            elif not _follow:
+                sol_q = current_lr_arm_q.copy()
+                sol_tauff = gravity_torque_for(arm_ik, sol_q)
+            else:
+                sol_q, sol_tauff = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             # ---- DIMENSO ADDITION: arms home on scene reset ----
@@ -1696,9 +1756,13 @@ if __name__ == '__main__':
 
     except KeyboardInterrupt:
         logger_mp.info("⛔ KeyboardInterrupt, exiting program...")
-    except Exception:
+    except Exception as control_error:
         import traceback
         logger_mp.error(traceback.format_exc())
+        START = False
+        STOP = True
+        _DIMENSO_SHUTDOWN.request()
+        _DIMENSO_SHUTDOWN.finish({'completed': False, 'reason': str(control_error)})
     finally:
         # ---- DIMENSO ADDITION: locomotion deadman ----
         # sharedmemorymanager.read_data() returns the last value FOREVER with no
@@ -1711,10 +1775,34 @@ if __name__ == '__main__':
         except Exception as _e:
             logger_mp.error(f"[dimenso] deadman publish failed: {_e}")
         # -------------- END DIMENSO ADDITION --------------
-        try:
-            arm_ctrl.ctrl_dual_arm_go_home()
-        except Exception as e:
-            logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
+        if _DIMENSO_SHUTDOWN.requested:
+            try:
+                failure = _DIMENSO_SHUTDOWN.snapshot()
+                if failure['SHUTDOWN_STATE'] == 'failed':
+                    try:
+                        loco_wrapper.stop_for_shutdown()
+                    except Exception as stop_error:
+                        _DIMENSO_SHUTDOWN.finish({
+                            'completed': False,
+                            'reason': f"{failure['SHUTDOWN_ERROR']}; zero-velocity stop failed: {stop_error}",
+                        })
+                else:
+                    loco_wrapper.stop_for_shutdown()
+                    result = arm_ctrl.ctrl_dual_arm_graceful_disconnect(
+                        gravity=lambda q: gravity_torque_for(arm_ik, q))
+                    _DIMENSO_SHUTDOWN.finish(result)
+            except Exception as e:
+                logger_mp.exception("Graceful shutdown failed; retaining IPC and controller")
+                _DIMENSO_SHUTDOWN.finish({'completed': False, 'reason': str(e)})
+            # No timeout kills a controller whose physical handback is unconfirmed.
+            # The backend acknowledges complete evidence; a failure remains observable.
+            while not _DIMENSO_SHUTDOWN.acknowledged.wait(0.1):
+                pass
+        else:
+            try:
+                arm_ctrl.ctrl_dual_arm_go_home()
+            except Exception as e:
+                logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
         
         try:
             if args.ipc:

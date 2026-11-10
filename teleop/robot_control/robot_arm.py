@@ -112,6 +112,12 @@ class G1_29_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        # DIMENSO ADDITION: do not publish a zero target before first engagement.
+        self.q_target = self.get_current_dual_arm_q().copy()
+        self._publish_sequence = 0
+        self._published_blend = None
+        self.command_error = None
+        self._recovery_active = False
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -152,11 +158,17 @@ class G1_29_ArmController:
                 for id in range(G1_29_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
+                # DIMENSO ADDITION: retain safety evidence from this same sample.
+                lowstate.received_at = time.monotonic()
+                for id in range(G1_29_Num_Motors):
+                    lowstate.motor_state[id].temperature = getattr(msg.motor_state[id], "temperature", None)
+                    lowstate.motor_state[id].motorstate = getattr(msg.motor_state[id], "motorstate", None)
                 self.lowstate_buffer.SetData(lowstate)
             time.sleep(0.002)
 
-    def clip_arm_q_target(self, target_q, velocity_limit):
-        current_q = self.get_current_dual_arm_q()
+    def clip_arm_q_target(self, target_q, velocity_limit, current_q=None):
+        if current_q is None:
+            current_q = self.get_current_dual_arm_q()
         delta = target_q - current_q
         motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
         cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
@@ -173,18 +185,41 @@ class G1_29_ArmController:
                 arm_q_target     = self.q_target
                 arm_tauff_target = self.tauff_target
 
+            # DIMENSO ADDITION: never publish NaN or derive commands from stale
+            # feedback. A fault stays latched; restored packets alone cannot resume.
+            sample = self._recovery_snapshot()
+            measured_q = np.asarray(sample.get("q"), dtype=float)
+            age = time.monotonic() - sample.get("received_at", float("-inf"))
+            valid = (measured_q.shape == (14,) and np.isfinite(measured_q).all()
+                     and np.isfinite(age) and 0 <= age <= .5
+                     and np.asarray(arm_q_target).shape == (14,)
+                     and np.asarray(arm_tauff_target).shape == (14,)
+                     and np.isfinite(arm_q_target).all() and np.isfinite(arm_tauff_target).all())
+            if not valid or getattr(self, "command_error", None):
+                if not getattr(self, "command_error", None):
+                    self.command_error = "Arm publication stopped: invalid/stale feedback or command; physical recovery required"
+                    logger_mp.error(self.command_error)
+                time.sleep(self.control_dt)
+                continue
             if self.simulation_mode:
                 cliped_arm_q_target = arm_q_target
             else:
-                cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+                limit = min(self.arm_velocity_limit, .5) if getattr(self, "_recovery_active", False) else self.arm_velocity_limit
+                cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit=limit, current_q=measured_q)
 
             for idx, id in enumerate(G1_29_JointArmIndex):
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
                 self.msg.motor_cmd[id].dq = 0
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
 
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            # DIMENSO ADDITION: publication evidence must follow a successful write.
+            with self.ctrl_lock:
+                published_blend = self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q
+                self.msg.crc = self.crc.Crc(self.msg)
+                wrote = self.lowcmd_publisher.Write(self.msg)
+                if wrote is True:
+                    self._publish_sequence += 1
+                    self._published_blend = published_blend
 
             if self._speed_gradual_max is True:
                 t_elapsed = start_time - self._gradual_start_time
@@ -219,6 +254,56 @@ class G1_29_ArmController:
         '''Return current state dq of the left and right arm motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
     
+    # DIMENSO ADDITION: explicit bounded recovery, separate from legacy q/exit.
+    def _recovery_snapshot(self):
+        state = self.lowstate_buffer.GetData()
+        if state is None:
+            return {}
+        motors = [state.motor_state[i] for i in G1_29_JointArmIndex]
+        temperatures = []
+        for motor in motors:
+            values = np.asarray(getattr(motor, "temperature", None), dtype=float)
+            temperatures.append(float(np.max(values)) if values.size else float("nan"))
+        return {"q": [motor.q for motor in motors],
+                "received_at": getattr(state, "received_at", float("-inf")),
+                "temperatures": temperatures,
+                "faults": [getattr(motor, "motorstate", None) for motor in motors]}
+
+    def get_current_dual_arm_recovery_snapshot(self):
+        """One receipt-consistent measured sample for engagement validation."""
+        return self._recovery_snapshot()
+
+    def _set_recovery_weight(self, weight):
+        with self.ctrl_lock:
+            self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight
+
+    def _recovery_publication(self):
+        with self.ctrl_lock:
+            return self._publish_sequence, self._published_blend
+
+    def ctrl_dual_arm_graceful_disconnect(self, gravity=None):
+        """Measured home and commanded handback; never claim firmware torque-off."""
+        if not self.motion_mode:
+            return dict(completed=False, reason="Graceful handback requires arm_sdk motion mode",
+                        homeReached=False, handbackPublished=False)
+        if gravity is None:
+            return dict(completed=False, reason="Gravity compensation unavailable",
+                        homeReached=False, handbackPublished=False)
+        from utils.dimenso_graceful_home import graceful_home
+        self._recovery_active = True
+        def command(q):
+            torque = np.asarray(gravity(q), dtype=float)
+            if torque.shape != (14,) or not np.isfinite(torque).all():
+                raise ValueError("Invalid gravity compensation")
+            self.ctrl_dual_arm(q, torque)
+        return graceful_home(
+            read=self._recovery_snapshot,
+            command=command,
+            set_weight=self._set_recovery_weight,
+            published=self._recovery_publication,
+        )
+    # END DIMENSO ADDITION
+
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
         logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")

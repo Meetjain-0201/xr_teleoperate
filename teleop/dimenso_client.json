@@ -6,13 +6,19 @@
     "arm_hold",
     "hand_reset",
     "collision_haptics",
-    "controller_input_diagnostics"
+    "controller_input_diagnostics",
+    "follow_anchor",
+    "graceful_disconnect_v1",
+    "graceful_home"
   ],
   "implementedBy": {
     "episode_buttons": "teleop/utils/dimenso_episode_buttons.py",
     "arm_hold": "teleop/utils/dimenso_arm_hold.py",
     "hand_reset": "teleop/utils/dimenso_hand_reset.py",
     "collision_haptics": "teleop/dimenso_haptics_client.py",
-    "controller_input_diagnostics": "teleop/utils/dimenso_input_diagnostics.py"
+    "controller_input_diagnostics": "teleop/utils/dimenso_input_diagnostics.py",
+    "follow_anchor": "teleop/utils/dimenso_follow_anchor.py",
+    "graceful_disconnect_v1": "teleop/utils/dimenso_shutdown.py",
+    "graceful_home": "teleop/utils/dimenso_graceful_home.py"
   }
 }

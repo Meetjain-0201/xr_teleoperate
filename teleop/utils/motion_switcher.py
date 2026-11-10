@@ -63,6 +63,20 @@ class LocoClientWrapper:
         self.client.StopMove()
     # -------------------------- END DIMENSO ADDITION --------------------------
 
+    def stop_for_shutdown(self):
+        """Require a zero-velocity RPC acknowledgment before arm handback.
+
+        This confirms command acceptance, not measured physical standstill.
+        Use the retained client; never instantiate another robot controller.
+        """
+        self.client.SetTimeout(1.0)
+        try:
+            code = self.client.SetVelocity(0.0, 0.0, 0.0)
+            if code != 0 or code is None:
+                raise RuntimeError(f"Zero-velocity command was not acknowledged: {code}")
+        finally:
+            self.client.SetTimeout(0.0001)
+
     def Move(self, vx, vy, vyaw):
         self.client.Move(vx, vy, vyaw, continous_move=False)
 

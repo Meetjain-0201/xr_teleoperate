@@ -61,6 +61,8 @@ class IPC_Server:
     """
     # Mapping table for on_press keys
     cmd_map = {
+        "CMD_DISCONNECT_GRACEFUL": "graceful_disconnect",
+        "CMD_SHUTDOWN_ACK": "shutdown_ack",
         "CMD_START": "r",          # launch
         "CMD_STOP": "q",           # exit
         "CMD_RECORD_TOGGLE": "s",  # start & stop (toggle record)
