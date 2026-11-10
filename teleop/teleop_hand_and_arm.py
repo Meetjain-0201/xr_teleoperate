@@ -74,6 +74,11 @@ def on_press(key):
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
+# DIMENSO ADDITION (DIM-914): additive diagnostics, no publisher or command path.
+from utils.dimenso_input_diagnostics import InputDiagnostics
+_DIMENSO_INPUT_DIAGNOSTICS = InputDiagnostics()
+
+
 def get_state() -> dict:
     """Return current heartbeat state"""
     global START, STOP, RECORD_RUNNING, READY
@@ -85,6 +90,7 @@ def get_state() -> dict:
         "RECORD_RUNNING": RECORD_RUNNING,
         "EPISODE_EVENTS": buttons.snapshot() if buttons is not None else [],
         "FOLLOW_PAUSED": buttons.paused if buttons is not None else False,
+        "INPUT_DIAGNOSTICS": _DIMENSO_INPUT_DIAGNOSTICS.snapshot(),
     }
 
 
@@ -1251,6 +1257,7 @@ if __name__ == '__main__':
                     _dimenso_discard_held = 0
             # ---------------------- END DIMENSO ADDITION ----------------------
 
+            _dimenso_input_mode = "unsupported"
             if (_DIMENSO_EPISODE_BUTTONS is not None and
                     release_brainco_at_home(
                         phase=_dimenso_last_recording_phase,
@@ -1261,6 +1268,7 @@ if __name__ == '__main__':
                 # home. Open there so the operator can reset the object without
                 # removing the headset. Quest triggers cannot re-close the hand
                 # until X+A starts the next take.
+                _dimenso_input_mode = "home-open"
                 with left_gripper_trigger_in.get_lock():
                     left_gripper_trigger_in.value = 10.0
                 with left_gripper_squeeze_in.get_lock():
@@ -1270,13 +1278,14 @@ if __name__ == '__main__':
                 with right_gripper_squeeze_in.get_lock():
                     right_gripper_squeeze_in.value = 0.0
             elif _DIMENSO_EPISODE_BUTTONS is not None and _DIMENSO_EPISODE_BUTTONS.paused:
-                pass  # Hold fingers during a mid-take A pause or the arm home ramp.
+                _dimenso_input_mode = "hold"  # Existing commands remain unchanged.
             elif args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
             elif args.ee == "brainco" and args.input_mode == "controller":
+                _dimenso_input_mode = "controller"
                 with left_gripper_trigger_in.get_lock():
                     left_gripper_trigger_in.value = tele_data.left_ctrl_triggerValue
                 with left_gripper_squeeze_in.get_lock():
@@ -1286,6 +1295,7 @@ if __name__ == '__main__':
                 with right_gripper_squeeze_in.get_lock():
                     right_gripper_squeeze_in.value = tele_data.right_ctrl_squeezeValue
             elif args.ee == "inspire_dfx" and args.input_mode == "controller":
+                _dimenso_input_mode = "controller"
                 # ---- DIMENSO ADDITION: the hand swap is PHYSICAL-ROBOT ONLY ----
                 # The cross below was confirmed on the real robot (2026-07-21 live
                 # test): right controller's trigger drives the left hand and vice
@@ -1313,6 +1323,7 @@ if __name__ == '__main__':
                         right_gripper_trigger_in.value = tele_data.left_ctrl_triggerValue
                 # -------------------- END DIMENSO ADDITION --------------------
             elif args.ee == "dex1" and args.input_mode == "controller":
+                _dimenso_input_mode = "controller"
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
                 with right_gripper_value.get_lock():
@@ -1324,6 +1335,25 @@ if __name__ == '__main__':
                     right_gripper_value.value = tele_data.right_hand_pinchValue
             else:
                 pass
+            # DIMENSO ADDITION (DIM-914): snapshot the values already assigned
+            # above. Held commands keep their original source sequence.
+            _dimenso_left = _dimenso_right = (None, None)
+            def _dimenso_input_value(shared):
+                with shared.get_lock():
+                    return shared.value
+            if args.input_mode == "controller" and args.ee in ("brainco", "inspire_dfx"):
+                _dimenso_left = (_dimenso_input_value(left_gripper_trigger_in),
+                                 _dimenso_input_value(left_gripper_squeeze_in) if args.ee == "brainco" else None)
+                _dimenso_right = (_dimenso_input_value(right_gripper_trigger_in),
+                                  _dimenso_input_value(right_gripper_squeeze_in) if args.ee == "brainco" else None)
+            elif args.input_mode == "controller" and args.ee == "dex1":
+                _dimenso_left = (_dimenso_input_value(left_gripper_value), None)
+                _dimenso_right = (_dimenso_input_value(right_gripper_value), None)
+            _DIMENSO_INPUT_DIAGNOSTICS.update(
+                tele_data.controller_diagnostics, left=_dimenso_left, right=_dimenso_right,
+                mode=_dimenso_input_mode,
+                paused=_DIMENSO_EPISODE_BUTTONS.paused if _DIMENSO_EPISODE_BUTTONS is not None else False,
+                engaged=START)
             with xr_motion_data_ready.get_lock():
                 xr_motion_data_ready.value = tele_data.motion_data_ready
 
@@ -1504,6 +1534,7 @@ if __name__ == '__main__':
                         current_body_state = []
                         current_body_action = []
                 elif args.ee == "dex1" and args.input_mode == "controller":
+                _dimenso_input_mode = "controller"
                     with dual_gripper_data_lock:
                         left_ee_state = [dual_gripper_state_array[0]]
                         right_ee_state = [dual_gripper_state_array[1]]
