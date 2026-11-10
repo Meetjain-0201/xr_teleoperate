@@ -25,3 +25,9 @@ def test_hold_after_source_restart_has_unknown_source_sequence():
     restarted=sample();restarted['streamId']='two'
     state.update(restarted,left=(8,.3),right=(1,.8),mode='hold',paused=True,engaged=True,now=11)
     assert state.snapshot(now=11)['applied']['sourceSequence'] is None
+
+
+def test_actual_teleop_entrypoint_compiles_without_running_hardware():
+    from pathlib import Path
+    path=Path(__file__).resolve().parents[1]/'teleop'/'teleop_hand_and_arm.py'
+    compile(path.read_text(),str(path),'exec')

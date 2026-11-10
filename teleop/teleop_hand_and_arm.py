@@ -1534,7 +1534,6 @@ if __name__ == '__main__':
                         current_body_state = []
                         current_body_action = []
                 elif args.ee == "dex1" and args.input_mode == "controller":
-                _dimenso_input_mode = "controller"
                     with dual_gripper_data_lock:
                         left_ee_state = [dual_gripper_state_array[0]]
                         right_ee_state = [dual_gripper_state_array[1]]
