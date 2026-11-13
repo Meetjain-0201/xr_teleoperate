@@ -12,6 +12,7 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import ( LowCmd_  as go_LowCmd, LowS
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
 
 import logging_mp
+from teleop.utils.dimenso_waist_upright import WaistUpright  # DIMENSO ADDITION (DIM-927)
 logger_mp = logging_mp.getLogger(__name__)
 
 kTopicLowCommand_Debug  = "rt/lowcmd"
@@ -136,6 +137,17 @@ class G1_29_ArmController:
             self.msg.motor_cmd[id].q  = self.all_motor_q[id]
         logger_mp.info("Lock OK!")
 
+        # ---- DIMENSO ADDITION (DIM-927): WAIST TO UPRIGHT, NOT FROZEN WHERE IT WAS ----
+        # The lock above holds the waist at whatever pose it had at startup (0.151 rad forward
+        # on 2026-11-13, dimenso-context#717). Move it linearly to 0 over 3 s, as Unitree's
+        # g1_arm7_sdk_dds_example (waist target 0) and upstream 845b25a (R1 waist go-home) do.
+        self._dimenso_waist_ids = (G1_29_JointIndex.kWaistYaw, G1_29_JointIndex.kWaistRoll, G1_29_JointIndex.kWaistPitch)
+        self._dimenso_waist = WaistUpright(
+            start_q=[self.all_motor_q[i] for i in self._dimenso_waist_ids],
+            duration_s=3.0, control_dt=self.control_dt)
+        logger_mp.info(f"[G1_29_ArmController] waist {[round(float(self.all_motor_q[i]), 3) for i in self._dimenso_waist_ids]} -> upright over 3 s")
+        # ---- END DIMENSO ADDITION ----
+
         # initialize publish thread
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
         self.ctrl_lock = threading.Lock()
@@ -182,6 +194,11 @@ class G1_29_ArmController:
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
                 self.msg.motor_cmd[id].dq = 0
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
+
+            # DIMENSO ADDITION (DIM-927): the waist follows WaistUpright (see __init__).
+            waist_q = self._dimenso_waist.next()
+            for idx, id in enumerate(self._dimenso_waist_ids):
+                self.msg.motor_cmd[id].q = float(waist_q[idx])
 
             self.msg.crc = self.crc.Crc(self.msg)
             self.lowcmd_publisher.Write(self.msg)
