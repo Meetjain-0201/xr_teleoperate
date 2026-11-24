@@ -44,6 +44,10 @@ TTL_MS = 200
 MEASURED_STALE_S = 0.5
 SEND_HZ = 50.0
 HAND_FINGERS = 6
+#: G1 body index of waist yaw (roll 13, pitch 14).
+WAIST_YAW_INDEX = 12
+#: A waist goal rides on a q14 only when yaw moved this much (robotics-onboard pose_stream WAIST_SEND_EPS_RAD).
+WAIST_SEND_EPS_RAD = 0.005
 
 
 def _ws_url(base: str, path: str, **query: str) -> str:
@@ -59,6 +63,7 @@ class LinkTelemetry:
         self._lock = threading.Lock()
         self._q: Optional[np.ndarray] = None
         self._dq: Optional[np.ndarray] = None
+        self._waist_yaw: Optional[float] = None
         self._at = 0.0
         self.frames = 0
         threading.Thread(target=self._run, name="dimenso-link-telemetry", daemon=True).start()
@@ -90,8 +95,13 @@ class LinkTelemetry:
             return
         if not (np.all(np.isfinite(q)) and np.all(np.isfinite(dq))):
             return
+        try:
+            yaw = float(by[WAIST_YAW_INDEX]["q"])
+        except (KeyError, TypeError, ValueError):
+            yaw = None
         with self._lock:
             self._q, self._dq, self._at = q, dq, time.monotonic()
+            self._waist_yaw = yaw if yaw is not None and np.isfinite(yaw) else None
             self.frames += 1
 
     def arm(self) -> tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
@@ -103,6 +113,13 @@ class LinkTelemetry:
             if age > MEASURED_STALE_S:
                 return None, None, age
             return self._q.copy(), self._dq.copy(), age
+
+    def waist_yaw(self) -> Optional[float]:
+        """The measured waist yaw (rad) from the same fresh frame as `arm()`, else None."""
+        with self._lock:
+            if self._q is None or time.monotonic() - self._at > MEASURED_STALE_S:
+                return None
+            return self._waist_yaw
 
     def wait_fresh(self, timeout_s: float) -> np.ndarray:
         deadline = time.monotonic() + timeout_s
@@ -215,6 +232,8 @@ class LinkArmController:
         self._gradual_start: Optional[float] = None
         self.all_motor_q = None
         self.sent_frames = 0
+        self._waist_goal: Optional[float] = None     # solved waist yaw; None = the robot keeps its own waist goal
+        self._waist_sent: Optional[float] = None
         threading.Thread(target=self._pump, name="dimenso-link-arm", daemon=True).start()
 
     def _pump(self) -> None:
@@ -228,8 +247,15 @@ class LinkArmController:
             if np.all(np.isfinite(target)) and target.shape == (14,):
                 step = self.arm_velocity_limit * dt
                 self._sent = self._sent + np.clip(target - self._sent, -step, step)
-                if self._stream.send({"q14": [float(v) for v in self._sent]}):
+                msg = {"q14": [float(v) for v in self._sent]}
+                yaw = self._waist_goal
+                if yaw is not None and (self._waist_sent is None or abs(yaw - self._waist_sent) >= WAIST_SEND_EPS_RAD):
+                    # roll and pitch stay upright (robotics-onboard 4319c2c, DIM-927); the robot rate-limits the waist
+                    msg["waist3"] = [float(yaw), 0.0, 0.0]
+                if self._stream.send(msg):
                     self.sent_frames += 1
+                    if "waist3" in msg:
+                        self._waist_sent = yaw
             time.sleep(max(0.0, dt - (time.monotonic() - t0)))
 
     # ---- the G1_29_ArmController surface the loop and ArmHold use ----
@@ -237,6 +263,14 @@ class LinkArmController:
         with self.ctrl_lock:
             self.q_target = np.asarray(q_target, dtype=float)
             self.tauff_target = np.asarray(tauff_target, dtype=float)
+
+    def set_waist_yaw(self, yaw: Optional[float]) -> None:
+        """The IK's solved waist yaw (rad), or None to leave the robot's waist goal alone."""
+        self._waist_goal = None if yaw is None or not np.isfinite(yaw) else float(yaw)
+
+    def measured_waist_yaw(self) -> float:
+        yaw = self._tm.waist_yaw()
+        return 0.0 if yaw is None else yaw
 
     def _measured(self) -> tuple[np.ndarray, np.ndarray]:
         q, dq, _ = self._tm.arm()

@@ -748,7 +748,8 @@ if __name__ == '__main__':
 
         # arm
         if args.arm == "G1_29":
-            arm_ik = G1_29_ArmIK()
+            # DIMENSO ADDITION (DIM-752): over the link the IK also solves waist yaw (DIMENSO_IK_WAIST_YAW=0 turns it off).
+            arm_ik = G1_29_ArmIK(waist_yaw=args.link and os.environ.get("DIMENSO_IK_WAIST_YAW", "1") == "1")
             if args.link:
                 # DIMENSO ADDITION (DIM-752): ramps the arms home over the link, then holds until engage.
                 from teleop.utils.dimenso_link import LinkArmController
@@ -1101,6 +1102,8 @@ if __name__ == '__main__':
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
+        if args.link and getattr(arm_ik, "solve_waist_yaw", False):   # DIMENSO ADDITION (DIM-752)
+            arm_ik.seed_waist_yaw(arm_ctrl.measured_waist_yaw())
 
         head_img = None
         left_wrist_img = None
@@ -1526,6 +1529,9 @@ if __name__ == '__main__':
             # through the loop that already owns q_target, so nothing fights it.
             if _DIMENSO_EPISODE_BUTTONS is not None and _DIMENSO_EPISODE_BUTTONS.paused:
                 if _dimenso_arm_hold.returning_home:
+                    if args.link and getattr(arm_ik, "solve_waist_yaw", False):   # DIMENSO ADDITION (DIM-752): home = upright
+                        arm_ctrl.set_waist_yaw(0.0)
+                        arm_ik.seed_waist_yaw(0.0)
                     arm_ctrl.ctrl_dual_arm(*_dimenso_arm_hold.home_command(
                         current_lr_arm_q,
                         lambda q: gravity_torque_for(arm_ik, q),
@@ -1542,6 +1548,8 @@ if __name__ == '__main__':
                     _DIMENSO_RESET_FLAG = 0.0
                     logger_mp.info("[dimenso] arms-home window ended; following again")
                 arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                if args.link and getattr(arm_ik, "solve_waist_yaw", False):   # DIMENSO ADDITION (DIM-752)
+                    arm_ctrl.set_waist_yaw(arm_ik.waist_yaw)
             # -------------- END DIMENSO ADDITION --------------
 
             # record data

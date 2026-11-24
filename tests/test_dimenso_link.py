@@ -135,3 +135,14 @@ def test_a_refused_stream_is_named_and_sends_nothing():
         assert s.diagnostics()["arm"]["refused"].startswith("arm_writer_busy")
     finally:
         b.close()
+
+
+def test_solved_waist_yaw_rides_on_q14_with_upright_roll_and_pitch(backend):
+    s = dl.LinkSession(backend.base, "r", "ctl-test")
+    arm = dl.LinkArmController(s.telemetry, s.arm_stream)
+    assert wait_for(lambda: len(backend.targets["arm-stream"]) >= 3)
+    assert all("waist3" not in t for t in backend.targets["arm-stream"])    # nothing until the IK solves one
+    arm.set_waist_yaw(0.1)
+    assert wait_for(lambda: any("waist3" in t for t in backend.targets["arm-stream"]))
+    sent = [t["waist3"] for t in backend.targets["arm-stream"] if "waist3" in t]
+    assert sent[0] == [0.1, 0.0, 0.0] and len(sent) == 1     # sent once, not every frame
