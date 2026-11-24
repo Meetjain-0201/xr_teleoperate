@@ -26,6 +26,7 @@ routes (routers/robot_teleop.py) and robot telemetry socket (routers/robot_conne
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from typing import Callable, Optional
@@ -182,14 +183,15 @@ class LinkStream:
             if self._ws is ws:
                 self._ws = None
 
-    def send(self, payload: dict) -> bool:
+    def send(self, payload: dict) -> int:
+        """The seq sent (truthy), or 0 when nothing could be sent."""
         with self._lock:
             try:
                 if self._ws is None:
                     self._ws = self._open()
                 self._seq += 1
                 self._ws.send(json.dumps({"type": "target", "seq": self._seq, "ttlMs": TTL_MS, **payload}))
-                return True
+                return self._seq
             except Exception as exc:
                 if self._ws is not None:
                     try:
@@ -200,7 +202,7 @@ class LinkStream:
                 if str(exc) != self.last_reject:
                     logger_mp.warning("[dimenso-link] %s send failed: %s", self.name, exc)
                 self.last_reject = str(exc)
-                return False
+                return 0
 
     def close(self) -> None:
         with self._lock:
@@ -210,6 +212,36 @@ class LinkStream:
                 except Exception:
                     pass
             self._ws = None
+
+
+class LinkTrace:
+    """One JSON line per NEW arm target: when the controller event behind it arrived (laptop clock), when the IK
+    produced it and when it was sent, with the stream seq and the 14 targets. The robot reports the seq it accepted
+    and its measured joints in telemetry, so controller -> robot can be measured end to end on one clock.
+    File: $DIMENSO_LINK_TRACE, else $XDG_STATE_HOME/dimenso/link-trace/<start>.jsonl; none when it cannot be opened."""
+
+    def __init__(self, path: Optional[str] = None) -> None:
+        if path is None:
+            base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+            path = os.environ.get("DIMENSO_LINK_TRACE") or os.path.join(
+                base, "dimenso", "link-trace", time.strftime("%Y%m%d-%H%M%S") + ".jsonl")
+        self.path = path
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self._f = open(path, "a", buffering=1 << 16)
+            logger_mp.info("[dimenso-link] tracing arm targets to %s", path)
+        except OSError as exc:
+            self._f = None
+            logger_mp.warning("[dimenso-link] no arm trace (%s): controller -> robot cannot be measured", exc)
+        self._last_flush = time.monotonic()
+
+    def write(self, rec: dict) -> None:
+        if self._f is None:
+            return
+        self._f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        if time.monotonic() - self._last_flush > 1.0:
+            self._f.flush()
+            self._last_flush = time.monotonic()
 
 
 class LinkArmController:
@@ -231,6 +263,8 @@ class LinkArmController:
         self.arm_velocity_limit = home_rad_s
         self._gradual_start: Optional[float] = None
         self._new_target = threading.Event()
+        self._fresh: Optional[tuple] = None          # (controller event unix ms, IK unix s) of the newest target
+        self.trace = LinkTrace()
         self.all_motor_q = None
         self.sent_frames = 0
         self._waist_goal: Optional[float] = None     # solved waist yaw; None = the robot keeps its own waist goal
@@ -254,20 +288,29 @@ class LinkArmController:
                 step = self.arm_velocity_limit * dt
                 self._sent = self._sent + np.clip(target - self._sent, -step, step)
                 msg = {"q14": [float(v) for v in self._sent]}
+                fresh, self._fresh = self._fresh, None
                 yaw = self._waist_goal
                 if yaw is not None and (self._waist_sent is None or abs(yaw - self._waist_sent) >= WAIST_SEND_EPS_RAD):
                     # roll and pitch stay upright (robotics-onboard 4319c2c, DIM-927); the robot rate-limits the waist
                     msg["waist3"] = [float(yaw), 0.0, 0.0]
-                if self._stream.send(msg):
+                seq = self._stream.send(msg)
+                if seq:
                     self.sent_frames += 1
                     if "waist3" in msg:
                         self._waist_sent = yaw
+                    if fresh is not None:
+                        self.trace.write({"seq": seq, "streamId": self._stream.stream_id, "srcMs": fresh[0],
+                                          "ikT": fresh[1], "sendT": time.time(), "q14": msg["q14"],
+                                          "target": [float(v) for v in target]})
 
     # ---- the G1_29_ArmController surface the loop and ArmHold use ----
-    def ctrl_dual_arm(self, q_target, tauff_target) -> None:
+    def ctrl_dual_arm(self, q_target, tauff_target, source_ms: Optional[float] = None) -> None:
+        """`source_ms`: receipt time (unix ms) of the controller event this target was solved from, for the trace."""
         with self.ctrl_lock:
             self.q_target = np.asarray(q_target, dtype=float)
             self.tauff_target = np.asarray(tauff_target, dtype=float)
+        if source_ms is not None:
+            self._fresh = (float(source_ms), time.time())
         self._new_target.set()
 
     def set_waist_yaw(self, yaw: Optional[float]) -> None:

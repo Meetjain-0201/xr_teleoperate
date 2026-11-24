@@ -1556,7 +1556,11 @@ if __name__ == '__main__':
                 if _DIMENSO_RESET_FLAG:
                     _DIMENSO_RESET_FLAG = 0.0
                     logger_mp.info("[dimenso] arms-home window ended; following again")
-                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                if args.link:   # DIMENSO ADDITION (DIM-752): trace controller event -> target -> robot
+                    arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff,
+                                           source_ms=(tele_data.controller_diagnostics or {}).get("receivedAtUnixMs"))
+                else:
+                    arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
                 if args.link and getattr(arm_ik, "solve_waist_yaw", False):   # DIMENSO ADDITION (DIM-752)
                     arm_ctrl.set_waist_yaw(arm_ik.waist_yaw)
             # -------------- END DIMENSO ADDITION --------------
