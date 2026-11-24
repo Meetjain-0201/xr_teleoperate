@@ -78,11 +78,16 @@ def test_brainco_mapping_matches_the_wired_controller():
 
 def test_arm_ramps_home_from_the_measured_pose_never_jumps(backend):
     s = dl.LinkSession(backend.base, "r", "ctl-test")
+    t_start = time.time()
     arm = dl.LinkArmController(s.telemetry, s.arm_stream, home_rad_s=0.6)
     assert wait_for(lambda: len(backend.targets["arm-stream"]) >= 5)
     first = np.array(backend.targets["arm-stream"][0]["q14"])
-    # the first target is one rate-limited step from the MEASURED pose, toward zero
-    assert np.max(np.abs(first - np.array(backend.arm_q))) <= 0.6 / dl.SEND_HZ + 1e-9
+    # the first target is one rate-limited step from the MEASURED pose, toward zero (timer slack allowed)
+    assert np.max(np.abs(first - np.array(backend.arm_q))) <= 0.6 * 1.5 / dl.SEND_HZ
+    # and the whole ramp never beats 0.6 rad/s of real time
+    time.sleep(0.3)
+    last = np.array(backend.targets["arm-stream"][-1]["q14"])
+    assert np.max(np.abs(last - np.array(backend.arm_q))) <= 0.6 * (time.time() - t_start) + 1e-6
     assert all(t["ttlMs"] == dl.TTL_MS for t in backend.targets["arm-stream"])
     seqs = [t["seq"] for t in backend.targets["arm-stream"]]
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)

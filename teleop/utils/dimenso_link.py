@@ -230,6 +230,7 @@ class LinkArmController:
         self._sent = q0.copy()
         self.arm_velocity_limit = home_rad_s
         self._gradual_start: Optional[float] = None
+        self._new_target = threading.Event()
         self.all_motor_q = None
         self.sent_frames = 0
         self._waist_goal: Optional[float] = None     # solved waist yaw; None = the robot keeps its own waist goal
@@ -237,9 +238,14 @@ class LinkArmController:
         threading.Thread(target=self._pump, name="dimenso-link-arm", daemon=True).start()
 
     def _pump(self) -> None:
-        dt = 1.0 / SEND_HZ
+        """Send at once when the loop commands a new target (no 20 ms wait), else every 1/SEND_HZ to keep the
+        stream alive. The rate limit uses the real time since the last send."""
+        last = time.monotonic()
         while True:
+            self._new_target.wait(1.0 / SEND_HZ)
+            self._new_target.clear()
             t0 = time.monotonic()
+            dt, last = min(t0 - last, 0.1), t0
             with self.ctrl_lock:
                 target = np.asarray(self.q_target, dtype=float).copy()
             if self._gradual_start is not None:   # wired: 20 -> 30 rad/s over 5 s after START
@@ -256,13 +262,13 @@ class LinkArmController:
                     self.sent_frames += 1
                     if "waist3" in msg:
                         self._waist_sent = yaw
-            time.sleep(max(0.0, dt - (time.monotonic() - t0)))
 
     # ---- the G1_29_ArmController surface the loop and ArmHold use ----
     def ctrl_dual_arm(self, q_target, tauff_target) -> None:
         with self.ctrl_lock:
             self.q_target = np.asarray(q_target, dtype=float)
             self.tauff_target = np.asarray(tauff_target, dtype=float)
+        self._new_target.set()
 
     def set_waist_yaw(self, yaw: Optional[float]) -> None:
         """The IK's solved waist yaw (rad), or None to leave the robot's waist goal alone."""

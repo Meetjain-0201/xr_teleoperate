@@ -569,6 +569,11 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    # DIMENSO ADDITION (DIM-752): over the robot link the loop runs at 60 Hz unless --frequency is given. Each
+    # extra hop adds delay, so the loop and its 4-tap smoothing filter (1 frame of group delay) must not:
+    # 30 Hz cost ~17 ms wait + 33 ms filter; 60 Hz halves both. IK + render measured ~5 ms per loop.
+    if args.link and not any(a.startswith("--frequency") for a in sys.argv[1:]):
+        args.frequency = 60.0
     logger_mp.debug(f"args: {args}")
 
     try:
@@ -724,7 +729,10 @@ if __name__ == '__main__':
                                      zmq=camera_config['head_camera']['enable_zmq'],
                                      webrtc=camera_config['head_camera']['enable_webrtc'],
                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
-                                     arm_reference_mode="head_yaw"
+                                     arm_reference_mode="head_yaw",
+                                     # DIMENSO ADDITION (DIM-752): over the link the page shows the newest frame at the
+                                     # loop rate; televuer polls at display_fps, which at 30 added up to 33 ms.
+                                     **({"display_fps": args.frequency} if args.link else {}),
                                      )
 
         # DIM-547: pump starts AFTER the wrapper, never inside the loop.
@@ -963,7 +971,8 @@ if __name__ == '__main__':
         # are taken by the double-thumbstick stop combo (which called Damp() upstream
         # and calls StopMove() here since DIM-548). The hold requirement is so a
         # brushed button cannot engage a robot.
-        _DIMENSO_ENGAGE_TICKS = 12          # x 0.033s ~= 0.4s
+        # DIMENSO ADDITION (DIM-752): 0.4 s whatever --frequency is (12 ticks at the old fixed 30 Hz).
+        _DIMENSO_ENGAGE_TICKS = max(1, round(0.4 * args.frequency))
         # DIM-657: the walking-mode quit (right A) must not fire on the button
         # press that ENGAGED. False until right A is observed released. See the
         # block at the quit check for the measurement.
@@ -1068,7 +1077,7 @@ if __name__ == '__main__':
 
         READY = True                  # now ready to (1) enter START state
         while not START and not STOP: # wait for start or stop signal.
-            time.sleep(0.033)
+            time.sleep(1.0 / args.frequency)
             # -------- DIMENSO ADDITION: engage from inside the headset --------
             # This loop previously read NO controller state, so the only way to
             # engage was a laptop keypress/IPC command -- impossible while holding
