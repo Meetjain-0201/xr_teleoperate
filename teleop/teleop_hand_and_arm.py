@@ -730,9 +730,9 @@ if __name__ == '__main__':
                                      webrtc=camera_config['head_camera']['enable_webrtc'],
                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
                                      arm_reference_mode="head_yaw",
-                                     # DIMENSO ADDITION (DIM-752): over the link the page shows the newest frame at the
-                                     # loop rate; televuer polls at display_fps, which at 30 added up to 33 ms.
-                                     **({"display_fps": args.frequency} if args.link else {}),
+                                     # DIM-752: display_fps stays at televuer's 30 under --link too. 60 fps (527ee55) put
+                                     # the Vuer child at 100 % of a core JPEG-encoding, and that same process receives the
+                                     # controller events: they queued for seconds (Meet, 2026-11-24 18:08).
                                      )
 
         # DIM-547: pump starts AFTER the wrapper, never inside the loop.
