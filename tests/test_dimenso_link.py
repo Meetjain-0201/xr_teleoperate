@@ -135,7 +135,7 @@ def test_a_refused_stream_is_named_and_sends_nothing():
     b.refuse = "arm_writer_busy"
     try:
         s = dl.LinkSession(b.base, "r", "ctl-test")
-        assert s.arm_stream.send({"q14": [0.0] * 14}) is False
+        assert s.arm_stream.send({"q14": [0.0] * 14}) == 0
         assert "arm_writer_busy" in s.arm_stream.refused
         assert s.diagnostics()["arm"]["refused"].startswith("arm_writer_busy")
     finally:
@@ -151,3 +151,21 @@ def test_solved_waist_yaw_rides_on_q14_with_upright_roll_and_pitch(backend):
     assert wait_for(lambda: any("waist3" in t for t in backend.targets["arm-stream"]))
     sent = [t["waist3"] for t in backend.targets["arm-stream"] if "waist3" in t]
     assert sent[0] == [0.1, 0.0, 0.0] and len(sent) == 1     # sent once, not every frame
+
+
+def test_each_new_target_is_traced_with_its_controller_time(backend, tmp_path, monkeypatch):
+    monkeypatch.setenv("DIMENSO_LINK_TRACE", str(tmp_path / "trace.jsonl"))
+    s = dl.LinkSession(backend.base, "r", "ctl-test")
+    arm = dl.LinkArmController(s.telemetry, s.arm_stream)
+    arm.ctrl_dual_arm(np.full(14, 0.29), np.zeros(14), source_ms=123456.0)
+    def lines():
+        arm.trace._f.flush()
+        return (tmp_path / "trace.jsonl").read_text().splitlines()
+    assert wait_for(lambda: len(lines()) >= 1)
+    time.sleep(0.2)                              # keep-alive sends follow; none may be traced
+    recs = [json.loads(l) for l in lines()]
+    assert len(recs) == 1                       # only targets with a controller event, not keep-alives
+    r = recs[0]
+    assert r["srcMs"] == 123456.0 and r["sendT"] >= r["ikT"] and r["streamId"] == "s-arm-stream"
+    sent = [t for t in backend.targets["arm-stream"] if t["seq"] == r["seq"]]
+    assert sent and sent[0]["q14"] == r["q14"]
