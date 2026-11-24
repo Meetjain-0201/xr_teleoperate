@@ -3,6 +3,7 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_     
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
 
 from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
+from teleop.utils.dimenso_link import brainco_controller_targets  # DIMENSO ADDITION (DIM-752)
 import numpy as np
 from enum import IntEnum
 import threading
@@ -137,8 +138,6 @@ class Brainco_Controller_ctrl:
 
                 if xr_motion_data_ready:
                     # In the official document, the angles are in the range [0, 1] ==> 0.0: fully open  1.0: fully closed
-                    left_triger_value = (10.0 - left_trigger_value) / 10.0
-                    right_triger_value = (10.0 - right_trigger_value) / 10.0
                     # ---- DIMENSO ADDITION (DIM-657): FOUR FINGERS TOGETHER, THUMB SEPARATE ----
                     # Meet, after the first live hands test: "let the thumb close on grip,
                     # the 4 fingers go together, the thumb is essential and should work
@@ -162,19 +161,9 @@ class Brainco_Controller_ctrl:
                     # still hold (idx0 0~1.52 rad, idx1 0~1.05, idx2..5 0~1.47, normalised).
                     # The staged thumb-aux (nothing until half-pressed, so the thumb rotates
                     # in before it flexes) is preserved on the new input.
-                    left_q_target[0]  = np.clip((left_squeeze_value - 0.5) / 0.5, 0.0, 0.98)  # thumb-aux <- GRIP
-                    left_q_target[1]  = np.clip(left_squeeze_value / 0.5, 0.0, 0.7)           # thumb     <- GRIP
-                    left_q_target[2]  = np.clip(left_triger_value, 0.0, 0.98)   # index  <- TRIGGER
-                    left_q_target[3]  = np.clip(left_triger_value, 0.0, 0.98)   # middle <- TRIGGER
-                    left_q_target[4]  = np.clip(left_triger_value, 0.0, 0.98)   # ring   <- TRIGGER
-                    left_q_target[5]  = np.clip(left_triger_value, 0.0, 0.98)   # pinky  <- TRIGGER
-
-                    right_q_target[0] = np.clip((right_squeeze_value - 0.5) / 0.5, 0.0, 0.98) # thumb-aux <- GRIP
-                    right_q_target[1] = np.clip(right_squeeze_value / 0.5, 0.0, 0.7)          # thumb     <- GRIP
-                    right_q_target[2] = np.clip(right_triger_value, 0.0, 0.98)  # index  <- TRIGGER
-                    right_q_target[3] = np.clip(right_triger_value, 0.0, 0.98)  # middle <- TRIGGER
-                    right_q_target[4] = np.clip(right_triger_value, 0.0, 0.98)  # ring   <- TRIGGER
-                    right_q_target[5] = np.clip(right_triger_value, 0.0, 0.98)  # pinky  <- TRIGGER
+                    # One mapping for the wired and --link paths (teleop/utils/dimenso_link.py, DIM-752).
+                    left_q_target[:]  = brainco_controller_targets(left_trigger_value, left_squeeze_value)
+                    right_q_target[:] = brainco_controller_targets(right_trigger_value, right_squeeze_value)
                     # ---- END DIMENSO ADDITION ----
 
                 # get dual hand state

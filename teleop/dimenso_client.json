@@ -7,7 +7,8 @@
     "hand_reset",
     "collision_haptics",
     "controller_input_diagnostics",
-    "waist_upright"
+    "waist_upright",
+    "link_relay"
   ],
   "implementedBy": {
     "episode_buttons": "teleop/utils/dimenso_episode_buttons.py",
@@ -15,6 +16,7 @@
     "hand_reset": "teleop/utils/dimenso_hand_reset.py",
     "collision_haptics": "teleop/dimenso_haptics_client.py",
     "controller_input_diagnostics": "teleop/utils/dimenso_input_diagnostics.py",
-    "waist_upright": "teleop/utils/dimenso_waist_upright.py"
+    "waist_upright": "teleop/utils/dimenso_waist_upright.py",
+    "link_relay": "teleop/utils/dimenso_link.py"
   }
 }

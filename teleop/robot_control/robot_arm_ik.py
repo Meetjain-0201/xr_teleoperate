@@ -16,24 +16,41 @@ sys.path.append(parent2_dir)
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
 
+# ---- DIMENSO ADDITION (DIM-752): waist YAW as one more IK variable, optional ----
+# Same design as robotics-onboard xr_teleop/arm_ik.py (9f44ff7): yaw is solved, roll and pitch stay locked
+# (they move the upper-body mass the balance controller carries, #717), the torso turns only when the arms
+# alone cannot reach (a damping cost toward the last yaw plus a pull back to upright), and one solve moves
+# yaw at most MAX_WAIST_STEP_RAD. solve_ik still returns the 14 arm joints; the yaw is `arm_ik.waist_yaw`.
+WAIST_YAW_DAMPING = 2.0
+WAIST_YAW_UPRIGHT = 0.5
+MAX_WAIST_STEP_RAD = 0.02
+# ---- END DIMENSO ADDITION ----
+
+
 def gravity_torque_for(arm_ik, q):
     """Support a held arm target with the same reduced model used by solve_ik."""
     reduced = arm_ik.reduced_robot
     model = reduced.model
     q = np.asarray(q)
+    if getattr(arm_ik, "solve_waist_yaw", False) and q.shape == (14,):   # DIMENSO ADDITION (DIM-752)
+        return pin.rnea(model, reduced.data, np.concatenate(([arm_ik.waist_yaw], q)),
+                        np.zeros(model.nv), np.zeros(model.nv))[1:]
     if q.shape != (model.nq,):
         raise ValueError(f"arm target has shape {q.shape}, expected {(model.nq,)}")
     return pin.rnea(model, reduced.data, q, np.zeros(model.nv), np.zeros(model.nv))
 
 class G1_29_ArmIK:
-    def __init__(self, Unit_Test = False, Visualization = False):
+    def __init__(self, Unit_Test = False, Visualization = False, waist_yaw = False):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
         self.Unit_Test = Unit_Test
         self.Visualization = Visualization
+        # DIMENSO ADDITION (DIM-752): q = [waist_yaw, 14 arm] when on; a separate cache, never the locked model's.
+        self.solve_waist_yaw = bool(waist_yaw)
+        self.waist_yaw = 0.0
 
         # fixed cache file path
-        self.cache_path = "g1_29_model_cache.pkl"
+        self.cache_path = "g1_29_waist_yaw_model_cache.pkl" if self.solve_waist_yaw else "g1_29_model_cache.pkl"
 
         if not self.Unit_Test:
             self.urdf_path = '../assets/g1/g1_body29_hand14.urdf'
@@ -83,6 +100,9 @@ class G1_29_ArmIK:
                                             "right_hand_middle_0_joint",
                                             "right_hand_middle_1_joint"
                                         ]
+
+            if self.solve_waist_yaw:   # DIMENSO ADDITION (DIM-752)
+                self.mixed_jointsToLockIDs.remove("waist_yaw_joint")
 
             self.reduced_robot = self.robot.buildReducedRobot(
                 list_of_joints_to_lock=self.mixed_jointsToLockIDs,
@@ -165,7 +185,11 @@ class G1_29_ArmIK:
             self.var_q,
             self.reduced_robot.model.upperPositionLimit)
         )
-        self.opti.minimize(50 * self.translational_cost + self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
+        self.opti.minimize(50 * self.translational_cost + self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost
+                           + (WAIST_YAW_DAMPING * (self.var_q[0] - self.var_q_last[0]) ** 2
+                              + WAIST_YAW_UPRIGHT * self.var_q[0] ** 2 if self.solve_waist_yaw else 0))
+        if self.solve_waist_yaw:   # DIMENSO ADDITION (DIM-752): one solve moves the torso at most this much
+            self.opti.subject_to(self.opti.bounded(-MAX_WAIST_STEP_RAD, self.var_q[0] - self.var_q_last[0], MAX_WAIST_STEP_RAD))
 
         opts = {
             # CasADi-level options
@@ -188,7 +212,7 @@ class G1_29_ArmIK:
         self.opti.solver("ipopt", opts)
 
         self.init_data = np.zeros(self.reduced_robot.model.nq)
-        self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 14)
+        self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), self.reduced_robot.model.nq)
         self.vis = None
 
         if self.Visualization:
@@ -260,7 +284,25 @@ class G1_29_ArmIK:
         robot_right_pose[:3, 3] *= scale_factor
         return robot_left_pose, robot_right_pose
 
+    def seed_waist_yaw(self, yaw):
+        """DIMENSO ADDITION (DIM-752): the measured waist yaw, so a solved yaw starts where the torso is."""
+        if np.isfinite(yaw):
+            self.waist_yaw = float(yaw)
+
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
+        if not self.solve_waist_yaw:
+            return self._solve_ik(left_wrist, right_wrist, current_lr_arm_motor_q, current_lr_arm_motor_dq)
+        # DIMENSO ADDITION (DIM-752): the loop speaks 14 arm joints; the solver works in [yaw, 14 arm].
+        q15 = None if current_lr_arm_motor_q is None else np.concatenate(([self.waist_yaw], current_lr_arm_motor_q))
+        dq15 = None if current_lr_arm_motor_dq is None else np.concatenate(([0.0], current_lr_arm_motor_dq))
+        sol_q, sol_tauff = self._solve_ik(left_wrist, right_wrist, q15, dq15)
+        sol_q = np.asarray(sol_q)
+        if sol_q.shape == (15,):
+            self.waist_yaw = float(sol_q[0])
+            return sol_q[1:], np.asarray(sol_tauff)[1:]
+        return sol_q, np.zeros(14)   # failed solve: the caller's current arm pose, as upstream
+
+    def _solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
         if current_lr_arm_motor_q is not None:
             self.init_data = current_lr_arm_motor_q
         self.opti.set_initial(self.var_q, self.init_data)

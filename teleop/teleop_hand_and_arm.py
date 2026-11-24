@@ -77,6 +77,7 @@ def on_press(key):
 # DIMENSO ADDITION (DIM-914): additive diagnostics, no publisher or command path.
 from utils.dimenso_input_diagnostics import InputDiagnostics
 _DIMENSO_INPUT_DIAGNOSTICS = InputDiagnostics()
+_DIMENSO_LINK = None  # DIMENSO ADDITION (DIM-752): teleop.utils.dimenso_link.LinkSession under --link
 
 
 def get_state() -> dict:
@@ -91,6 +92,8 @@ def get_state() -> dict:
         "EPISODE_EVENTS": buttons.snapshot() if buttons is not None else [],
         "FOLLOW_PAUSED": buttons.paused if buttons is not None else False,
         "INPUT_DIAGNOSTICS": _DIMENSO_INPUT_DIAGNOSTICS.snapshot(),
+        # DIMENSO ADDITION (DIM-752): what the robot link admitted, for the backend's status.
+        "LINK": _DIMENSO_LINK.diagnostics() if _DIMENSO_LINK is not None else None,
     }
 
 
@@ -552,6 +555,9 @@ if __name__ == '__main__':
     parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
+    # DIMENSO ADDITION (DIM-752): the same client, page and loop, but arms/hands/walking go through the
+    # backend's robot-link streams instead of DDS, so a real G1 is driven over Wi-Fi (teleop/utils/dimenso_link.py).
+    parser.add_argument('--link', action = 'store_true', help = 'Drive a real robot over its robot link (no DDS)')
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--affinity', action = 'store_true', help = 'Enable high priority and set CPU affinity mode')
     # record mode and task info
@@ -567,7 +573,15 @@ if __name__ == '__main__':
 
     try:
         # setup dds communication domains id
-        if args.sim:
+        if args.link:
+            # DIMENSO ADDITION (DIM-752): no DDS participant at all; the backend names the robot and session.
+            if args.sim:
+                raise ValueError("--link drives a real robot; it cannot be combined with --sim")
+            from teleop.utils.dimenso_link import LinkSession
+            _DIMENSO_LINK = LinkSession(os.environ.get("DIMENSO_LINK_WS", ""),
+                                        os.environ.get("DIMENSO_LINK_ROBOT", ""),
+                                        os.environ.get("DIMENSO_LINK_SESSION", ""))
+        elif args.sim:
             ChannelFactoryInitialize(1, networkInterface=args.network_interface)
         else:
             ChannelFactoryInitialize(0, networkInterface=args.network_interface)
@@ -719,7 +733,12 @@ if __name__ == '__main__':
 
         
         # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
-        if args.motion:
+        if args.link:
+            # DIMENSO ADDITION (DIM-752): the robot stays in its standing mode; walking is the link's base stream.
+            if args.motion and args.input_mode == "controller":
+                from teleop.utils.dimenso_link import LinkLoco
+                loco_wrapper = LinkLoco(_DIMENSO_LINK.base_stream)
+        elif args.motion:
             if args.input_mode == "controller":
                 loco_wrapper = LocoClientWrapper()
         else:
@@ -729,8 +748,14 @@ if __name__ == '__main__':
 
         # arm
         if args.arm == "G1_29":
-            arm_ik = G1_29_ArmIK()
-            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+            # DIMENSO ADDITION (DIM-752): over the link the IK also solves waist yaw (DIMENSO_IK_WAIST_YAW=0 turns it off).
+            arm_ik = G1_29_ArmIK(waist_yaw=args.link and os.environ.get("DIMENSO_IK_WAIST_YAW", "1") == "1")
+            if args.link:
+                # DIMENSO ADDITION (DIM-752): ramps the arms home over the link, then holds until engage.
+                from teleop.utils.dimenso_link import LinkArmController
+                arm_ctrl = LinkArmController(_DIMENSO_LINK.telemetry, _DIMENSO_LINK.arm_stream)
+            else:
+                arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
@@ -801,7 +826,6 @@ if __name__ == '__main__':
             hand_ctrl = Brainco_Controller_hand(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
                                                 dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
         elif args.ee == "brainco" and args.input_mode == "controller":
-            from teleop.robot_control.robot_hand_brainco import Brainco_Controller_ctrl
             left_gripper_trigger_in = Value('d', 10.0, lock=True)  # [input]
             left_gripper_squeeze_in = Value('d', 0.0, lock=True)   # [input]
             right_gripper_trigger_in = Value('d', 10.0, lock=True) # [input]
@@ -809,8 +833,16 @@ if __name__ == '__main__':
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
             dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Brainco_Controller_ctrl(left_gripper_trigger_in, left_gripper_squeeze_in, right_gripper_trigger_in, right_gripper_squeeze_in,
-                                                dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
+            if args.link:
+                # DIMENSO ADDITION (DIM-752): same shared Values and mapping, sent over the link's hand stream.
+                from teleop.utils.dimenso_link import LinkBraincoHand
+                hand_ctrl = LinkBraincoHand(left_gripper_trigger_in, left_gripper_squeeze_in, right_gripper_trigger_in, right_gripper_squeeze_in,
+                                            dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array,
+                                            stream=_DIMENSO_LINK.hand_stream, xr_motion_data_ready_in=xr_motion_data_ready)
+            else:
+                from teleop.robot_control.robot_hand_brainco import Brainco_Controller_ctrl
+                hand_ctrl = Brainco_Controller_ctrl(left_gripper_trigger_in, left_gripper_squeeze_in, right_gripper_trigger_in, right_gripper_squeeze_in,
+                                                    dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
         else:
             pass
         
@@ -1070,6 +1102,8 @@ if __name__ == '__main__':
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         arm_ctrl.speed_gradual_max()
+        if args.link and getattr(arm_ik, "solve_waist_yaw", False):   # DIMENSO ADDITION (DIM-752)
+            arm_ik.seed_waist_yaw(arm_ctrl.measured_waist_yaw())
 
         head_img = None
         left_wrist_img = None
@@ -1495,6 +1529,9 @@ if __name__ == '__main__':
             # through the loop that already owns q_target, so nothing fights it.
             if _DIMENSO_EPISODE_BUTTONS is not None and _DIMENSO_EPISODE_BUTTONS.paused:
                 if _dimenso_arm_hold.returning_home:
+                    if args.link and getattr(arm_ik, "solve_waist_yaw", False):   # DIMENSO ADDITION (DIM-752): home = upright
+                        arm_ctrl.set_waist_yaw(0.0)
+                        arm_ik.seed_waist_yaw(0.0)
                     arm_ctrl.ctrl_dual_arm(*_dimenso_arm_hold.home_command(
                         current_lr_arm_q,
                         lambda q: gravity_torque_for(arm_ik, q),
@@ -1511,6 +1548,8 @@ if __name__ == '__main__':
                     _DIMENSO_RESET_FLAG = 0.0
                     logger_mp.info("[dimenso] arms-home window ended; following again")
                 arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                if args.link and getattr(arm_ik, "solve_waist_yaw", False):   # DIMENSO ADDITION (DIM-752)
+                    arm_ctrl.set_waist_yaw(arm_ik.waist_yaw)
             # -------------- END DIMENSO ADDITION --------------
 
             # record data
