@@ -24,6 +24,7 @@ from teleop.utils.ipc import IPC_Server
 from teleop.utils.dimenso_episode_buttons import EpisodeButtons
 from teleop.utils.dimenso_hand_reset import release_brainco_at_home
 from teleop.utils.dimenso_arm_hold import ArmHold
+from teleop.utils.dimenso_home_pose import parse_home_q
 from teleop.utils.motion_switcher import MotionSwitcher, LocoClientWrapper
 from sshkeyboard import listen_keyboard, stop_listening
 
@@ -557,6 +558,7 @@ if __name__ == '__main__':
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     # DIMENSO ADDITION (DIM-752): the same client, page and loop, but arms/hands/walking go through the
     # backend's robot-link streams instead of DDS, so a real G1 is driven over Wi-Fi (teleop/utils/dimenso_link.py).
+    parser.add_argument('--home-q', type=str, default=None, help='DIMENSO (DIM-752): 14 comma-separated arm joint radians (left 7, right 7) used as home; default all zeros')
     parser.add_argument('--link', action = 'store_true', help = 'Drive a real robot over its robot link (no DDS)')
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--affinity', action = 'store_true', help = 'Enable high priority and set CPU affinity mode')
@@ -569,6 +571,7 @@ if __name__ == '__main__':
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
 
     args = parser.parse_args()
+    _DIMENSO_HOME_Q = parse_home_q(args.home_q)   # DIMENSO ADDITION (DIM-752): task home pose, fail fast
     # DIMENSO ADDITION (DIM-752): over the robot link the loop runs at 60 Hz unless --frequency is given. Each
     # extra hop adds delay, so the loop and its 4-tap smoothing filter (1 frame of group delay) must not:
     # 30 Hz cost ~17 ms wait + 33 ms filter; 60 Hz halves both. IK + render measured ~5 ms per loop.
@@ -763,7 +766,7 @@ if __name__ == '__main__':
                 from teleop.utils.dimenso_link import LinkArmController
                 arm_ctrl = LinkArmController(_DIMENSO_LINK.telemetry, _DIMENSO_LINK.arm_stream)
             else:
-                arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+                arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=args.sim, home_q=_DIMENSO_HOME_Q)
         elif args.arm == "G1_23":
             arm_ik = G1_23_ArmIK()
             arm_ctrl = G1_23_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
@@ -997,7 +1000,7 @@ if __name__ == '__main__':
         _dimenso_paused_stop_sent = False
         _dimenso_last_recording_phase = None
         _dimenso_resume_waiting = False
-        _dimenso_arm_hold = ArmHold()
+        _dimenso_arm_hold = ArmHold(home_q=_DIMENSO_HOME_Q)
 
         # ---- DIMENSO ADDITION: arms home on scene reset ----
         # A whole-scene reset restores the robot and the objects, but the ARMS are
@@ -1551,7 +1554,7 @@ if __name__ == '__main__':
                     # is accepted and the recorder enters the reset window.
                     arm_ctrl.ctrl_dual_arm(*_dimenso_arm_hold.command())
             elif _DIMENSO_RESET_FLAG and time.time() < _DIMENSO_RESET_FLAG:
-                arm_ctrl.ctrl_dual_arm(_dimenso_np.zeros(14), _dimenso_np.zeros(14))
+                arm_ctrl.ctrl_dual_arm(_DIMENSO_HOME_Q.copy(), _dimenso_np.zeros(14))
             else:
                 if _DIMENSO_RESET_FLAG:
                     _DIMENSO_RESET_FLAG = 0.0
