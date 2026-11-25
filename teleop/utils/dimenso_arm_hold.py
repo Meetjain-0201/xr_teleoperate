@@ -8,8 +8,10 @@ import numpy as np
 
 
 class ArmHold:
-    def __init__(self, home_speed=0.8, home_tolerance=0.05):
+    def __init__(self, home_speed=0.8, home_tolerance=0.05, home_q=None):
         self._command = None
+        # DIM-752: the task's home pose; zeros = upstream home.
+        self.home_q = 0.0 if home_q is None else np.asarray(home_q, dtype=float).copy()
         self._home_target = None
         self._home_arrival_ticks = 0
         self.home_ready = False
@@ -44,17 +46,17 @@ class ArmHold:
         return self._home_target is not None
 
     def home_command(self, measured_q, gravity_torque, *, dt):
-        """Rate-limit q toward zero and hold computed support torque at each step."""
+        """Rate-limit q toward the home pose and hold computed support torque at each step."""
         if self._home_target is None:
             raise RuntimeError("arm home has not started")
         step = self.home_speed * min(max(dt, 0.0), 0.1)
-        self._home_target += np.clip(-self._home_target, -step, step)
+        self._home_target += np.clip(self.home_q - self._home_target, -step, step)
         q = self._home_target.copy()
         tau = gravity_torque(q)
         self._command = (q, tau.copy())
         at_home = (np.all(np.isfinite(measured_q))
-                   and np.max(np.abs(measured_q)) < self.home_tolerance
-                   and np.max(np.abs(q)) < self.home_tolerance)
+                   and np.max(np.abs(measured_q - self.home_q)) < self.home_tolerance
+                   and np.max(np.abs(q - self.home_q)) < self.home_tolerance)
         self._home_arrival_ticks = self._home_arrival_ticks + 1 if at_home else 0
         self.home_ready = self._home_arrival_ticks >= 3
         return self._command

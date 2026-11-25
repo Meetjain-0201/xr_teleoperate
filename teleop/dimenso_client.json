@@ -8,7 +8,8 @@
     "collision_haptics",
     "controller_input_diagnostics",
     "waist_upright",
-    "link_relay"
+    "link_relay",
+    "task_home_pose"
   ],
   "implementedBy": {
     "episode_buttons": "teleop/utils/dimenso_episode_buttons.py",
@@ -17,6 +18,7 @@
     "collision_haptics": "teleop/dimenso_haptics_client.py",
     "controller_input_diagnostics": "teleop/utils/dimenso_input_diagnostics.py",
     "waist_upright": "teleop/utils/dimenso_waist_upright.py",
-    "link_relay": "teleop/utils/dimenso_link.py"
+    "link_relay": "teleop/utils/dimenso_link.py",
+    "task_home_pose": "teleop/utils/dimenso_home_pose.py"
   }
 }

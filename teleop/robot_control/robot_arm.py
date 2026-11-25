@@ -66,9 +66,11 @@ class DataBuffer:
             self.data = data
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, motion_mode = False, simulation_mode = False, home_q = None):
         logger_mp.info("Initialize G1_29_ArmController...")
-        self.q_target = np.zeros(14)
+        # DIMENSO ADDITION (DIM-752): per-task home pose; None = upstream zeros.
+        self.home_q = np.zeros(14) if home_q is None else np.asarray(home_q, dtype=float).copy()
+        self.q_target = self.home_q.copy()
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
@@ -242,12 +244,12 @@ class G1_29_ArmController:
         max_attempts = 100
         current_attempts = 0
         with self.ctrl_lock:
-            self.q_target = np.zeros(14)
+            self.q_target = self.home_q.copy()   # DIMENSO ADDITION (DIM-752)
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
+            if np.all(np.abs(current_q - self.home_q) < tolerance):
                 if self.motion_mode:
                     for weight in np.linspace(1, 0, num=101):
                         self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight;
